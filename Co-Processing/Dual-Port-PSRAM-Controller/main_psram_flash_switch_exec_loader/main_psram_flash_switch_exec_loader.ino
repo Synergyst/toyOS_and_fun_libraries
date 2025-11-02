@@ -3,9 +3,9 @@
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 50000UL  // 50 kHz
-#define W25Q_SPI_CLOCK_HZ 50000UL     // NOR ID speed
-#define MX35_SPI_CLOCK_HZ 50000UL     // NAND ID speed
+#define UNIFIED_SPI_CLOCK_HZ 100000UL  // 50 kHz is known-good-max, anymore and you're pushing it.
+#define W25Q_SPI_CLOCK_HZ 100000UL     // NOR ID speed
+#define MX35_SPI_CLOCK_HZ 100000UL     // NAND ID speed
 #include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
