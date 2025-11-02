@@ -223,13 +223,13 @@ void loop() {
 
     case OWN_A:
       {
-        if (!reqA && !busAct) releaseToNone();
+        if (!reqA) releaseToNone();
       }
       break;
 
     case OWN_B:
       {
-        if (!reqB && !busAct) releaseToNone();
+        if (!reqB) releaseToNone();
       }
       break;
   }

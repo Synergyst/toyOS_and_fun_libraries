@@ -3,9 +3,9 @@
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 100000UL  // 50 kHz is known-good-max, anymore and you're pushing it.
-#define W25Q_SPI_CLOCK_HZ 100000UL     // NOR ID speed
-#define MX35_SPI_CLOCK_HZ 100000UL     // NAND ID speed
+#define UNIFIED_SPI_CLOCK_HZ 8100000UL  // 50 kHz is known-good-max, anymore and you're pushing it.
+#define W25Q_SPI_CLOCK_HZ 8100000UL     // NOR ID speed
+#define MX35_SPI_CLOCK_HZ 8100000UL     // NAND ID speed
 #include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
@@ -1784,6 +1784,9 @@ static void handleCommand(char* line) {
     Console.println("Unknown command. Type 'help'.");
   }
 }
+
+#include "BusArbiterClient.h"
+
 // ========== Setup and main loops ==========
 void setup() {
   Serial.begin(115200);
@@ -1817,6 +1820,9 @@ void setup() {
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   updateExecFsTable();
   Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+
+  BusArbiterClient::begin(/*REQ pin*/ 4, /*GRANT pin*/ 5, /*REQ active low*/ true, /*GRANT active high*/ true);
+
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
