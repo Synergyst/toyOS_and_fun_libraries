@@ -13,49 +13,40 @@
 #include <stddef.h>
 #include <string.h>
 #include <type_traits>
-
 namespace CoProc {
-
 // ========== Constants ==========
 static constexpr uint32_t MAGIC = 0x30525043;  // 'C''P''R''0'
 static constexpr uint16_t VERSION = 0x0001;
-
 // Commands (req: 0x00..0x7F, resp = req|0x80)
 enum : uint16_t {
   CMD_HELLO = 0x01,
   CMD_INFO = 0x02,
-
   // Binary blob pipeline
   CMD_LOAD_BEGIN = 0x10,  // req: uint32 total_len
   CMD_LOAD_DATA = 0x11,   // req: raw bytes
   CMD_LOAD_END = 0x12,    // req: uint32 expected_crc32
   CMD_EXEC = 0x20,        // req: uint32 argc, int32 argv[argc], uint32 timeout_ms
-
   // Status/mailbox/cancel/reset
   CMD_STATUS = 0x21,      // req: -
   CMD_MAILBOX_RD = 0x22,  // req: uint32 max_bytes
   CMD_CANCEL = 0x23,      // req: -
   CMD_RESET = 0x24,       // req: -
-
   // Script pipeline
   CMD_SCRIPT_BEGIN = 0x30,  // req: uint32 total_len
   CMD_SCRIPT_DATA = 0x31,   // req: raw bytes (UTF-8 text)
   CMD_SCRIPT_END = 0x32,    // req: uint32 expected_crc32
   CMD_SCRIPT_EXEC = 0x33,   // req: uint32 argc, int32 argv[argc], uint32 timeout_ms
                             //       (alternate mode supported by impl: marker 0xFFFFFFFF + ASCII args)
-
   // Named function dispatch
   CMD_FUNC = 0x40,  // req: uint32 name_len, bytes[name_len], uint32 argc,
                     //      if argc>0:
                     //        either classic: int32 argv[argc]
                     //        or alternate: uint32 marker=0xFFFFFFFF, then for each arg: uint32 slen, bytes[slen] (ASCII numeric)
                     // resp: int32 status, int32 result
-
   // ISP control
   CMD_ISP_ENTER = 0x60,  // req: -
   CMD_ISP_EXIT = 0x61    // req: -
 };
-
 // Status
 enum : int32_t {
   ST_OK = 0,
@@ -70,7 +61,6 @@ enum : int32_t {
   ST_TIMEOUT = -9,
   ST_EXEC = -10
 };
-
 // ========== Frame header ==========
 #pragma pack(push, 1)
 struct Frame {
@@ -82,7 +72,6 @@ struct Frame {
   uint32_t crc32;  // CRC over payload (0 if len==0)
 };
 #pragma pack(pop)
-
 inline void makeResponseHeader(Frame& h, uint16_t reqCmd, uint32_t seq, uint32_t len, uint32_t crc) {
   h.magic = MAGIC;
   h.version = VERSION;
@@ -91,7 +80,6 @@ inline void makeResponseHeader(Frame& h, uint16_t reqCmd, uint32_t seq, uint32_t
   h.len = len;
   h.crc32 = (len ? crc : 0);
 }
-
 // ========== CRC32 (IEEE 802.3) ==========
 inline uint32_t crc32_ieee(const void* data, size_t len, uint32_t crc = 0xFFFFFFFFu) {
   const uint8_t* p = (const uint8_t*)data;
@@ -102,7 +90,6 @@ inline uint32_t crc32_ieee(const void* data, size_t len, uint32_t crc = 0xFFFFFF
   }
   return crc ^ 0xFFFFFFFFu;
 }
-
 // ========== Small PODs ==========
 #pragma pack(push, 1)
 struct Info {
@@ -116,7 +103,6 @@ struct Info {
   uint32_t mailbox_max;  // bytes
 };
 #pragma pack(pop)
-
 // ========== Payload helpers ==========
 template<typename T>
 inline bool writePOD(uint8_t* dst, size_t cap, size_t& off, const T& v) {
@@ -127,14 +113,12 @@ inline bool writePOD(uint8_t* dst, size_t cap, size_t& off, const T& v) {
   off += sizeof(NV);
   return true;
 }
-
 inline bool writeBytes(uint8_t* dst, size_t cap, size_t& off, const void* p, size_t n) {
   if (off + n > cap) return false;
   memcpy(dst + off, p, n);
   off += n;
   return true;
 }
-
 template<typename T>
 inline bool readPOD(const uint8_t* src, size_t len, size_t& off, T& v) {
   if (off + sizeof(T) > len) return false;
@@ -142,14 +126,12 @@ inline bool readPOD(const uint8_t* src, size_t len, size_t& off, T& v) {
   off += sizeof(T);
   return true;
 }
-
 inline bool readBytes(const uint8_t* src, size_t len, size_t& off, void* p, size_t n) {
   if (off + n > len) return false;
   memcpy(p, src + off, n);
   off += n;
   return true;
 }
-
 // ========== Exec state flags ==========
 enum : uint32_t {
   EXEC_IDLE = 0,
@@ -157,5 +139,19 @@ enum : uint32_t {
   EXEC_RUNNING = 2,
   EXEC_DONE = 3
 };
+
+// ===== Optional shared CPLM header (used by host-side converter; kept here for cross-visibility) =====
+#pragma pack(push, 1)
+struct CoplmHeader {
+  char magic[4];    // "CPLM"
+  uint8_t version;  // 1
+  uint8_t reserved;
+  uint16_t flags;
+  uint32_t buzzPin;
+  uint32_t ledPin;
+  uint32_t gapMs;
+  uint32_t notesCount;
+};
+#pragma pack(pop)
 
 }  // namespace CoProc

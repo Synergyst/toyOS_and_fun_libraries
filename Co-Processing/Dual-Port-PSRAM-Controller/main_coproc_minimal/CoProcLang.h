@@ -691,4 +691,749 @@ private:
     return true;
   }
 };
+
+// ============================
+// Host-side MIDI -> CoProcLang utility
+// ============================
+// These utilities are meant to be called on the main CPU side to:
+//   1) Read a Standard MIDI File (SMF) from SimpleFS,
+//   2) Convert it to a compact, monophonic, tempo-aware note stream,
+//   3) Store a processed ".coplm" file describing the stream,
+//   4) Optionally generate CoProcLang script chunks from the .coplm and play them by calling a user-supplied callback.
+//
+// No heap is used: the caller supplies a scratch buffer (work) large enough to hold the MIDI file.
+//
+// Filesystem and playback callbacks (bind these to activeFs and ExecHost respectively):
+struct FsOps {
+  // All are optional except getFileSize + readFile + writeFile.
+  bool (*exists)(const char* name) = nullptr;
+  bool (*getFileSize)(const char* name, uint32_t& size) = nullptr;
+  uint32_t (*readFile)(const char* name, uint8_t* buf, uint32_t sz) = nullptr;
+  // If you don't provide readFileRange, the converter still works (it reads the whole file into work buffer).
+  uint32_t (*readFileRange)(const char* name, uint32_t off, uint8_t* buf, uint32_t len) = nullptr;
+  // A simple whole-write API is enough for .coplm (small). Replace mode is backend-specific; pass mode as provided by your activeFs wrapper.
+  bool (*writeFile)(const char* name, const uint8_t* data, uint32_t len, int writeMode) = nullptr;
+};
+
+struct PlayOps {
+  // Provide a callback that will send one whole CoProcLang script text to the co-processor and run it.
+  // Typical integration: in the callback, call ExecHost.coprocScriptBegin/Data/End/Exec or its convenient wrappers if any.
+  // Return true on success.
+  bool (*playScriptText)(const char* scriptText, uint32_t len, uint32_t timeoutMs, int32_t& outRetVal) = nullptr;
+};
+
+// Configurable bounds for MIDI → note processing
+#ifndef COPROCLANG_MIDI_MAX_TEMPO_EVENTS
+#define COPROCLANG_MIDI_MAX_TEMPO_EVENTS 256
+#endif
+#ifndef COPROCLANG_MIDI_MAX_TRACKS
+#define COPROCLANG_MIDI_MAX_TRACKS 32
+#endif
+
+// Helper: raw .coplm entry (compact; duration microseconds; noteNumber = MIDI note 0..127)
+struct CoplmNoteEntry {
+  uint8_t note;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  uint32_t dur_us;
+};
+
+// Shared header constants (matches CoProc::CoplmHeader in CoProcProto.h)
+static inline void makeCoplmName(char* out, size_t outCap, const char* midiNameBase) {
+  // Build "<base>.coplm" from "<base>" (assume midiNameBase <= 32 chars in your FS)
+  size_t L = strlen(midiNameBase);
+  const char* base = midiNameBase;
+  // strip extension if present (find last '.')
+  const char* dot = nullptr;
+  for (size_t i = 0; i < L; ++i)
+    if (midiNameBase[i] == '.') dot = midiNameBase + i;
+  char core[40];
+  size_t coreLen = 0;
+  if (dot) {
+    coreLen = (size_t)(dot - midiNameBase);
+    if (coreLen >= sizeof(core) - 1) coreLen = sizeof(core) - 1;
+    memcpy(core, midiNameBase, coreLen);
+    core[coreLen] = 0;
+  } else {
+    coreLen = (L < sizeof(core) - 1) ? L : (sizeof(core) - 1);
+    memcpy(core, midiNameBase, coreLen);
+    core[coreLen] = 0;
+  }
+  snprintf(out, outCap, "%s.coplm", core);
+}
+
+// Simple MIDI parser (SMF format 0 or 1; time division = ticksPerBeat only).
+// We parse twice:
+//   Pass A: scan all tracks to build tempo map (meta 0x51) and pick the melody track (most note-on events or user-specified).
+//   Pass B: scan selected track and produce monophonic notes via preemption reduction, computing durations in microseconds.
+struct TempoEvent {
+  uint32_t absTicks;
+  uint32_t usPerBeat;
+};
+static inline double midiNoteToFreq(int note) {
+  // 440 * 2^((n-69)/12)
+  double x = (double)(note - 69) / 12.0;
+  // use Arduino math
+  return 440.0 * pow(2.0, x);
+}
+static inline uint32_t vlq(const uint8_t*& p, const uint8_t* end, bool& ok) {
+  ok = false;
+  uint32_t v = 0;
+  int cnt = 0;
+  while (p < end) {
+    uint8_t b = *p++;
+    v = (v << 7) | (b & 0x7F);
+    cnt++;
+    if ((b & 0x80) == 0) {
+      ok = true;
+      return v;
+    }
+    if (cnt > 4) { return 0; }
+  }
+  return 0;
+}
+static bool parseHeaderSMF(const uint8_t* data, uint32_t len, uint16_t& fmt, uint16_t& ntrks, uint16_t& division, uint32_t& off) {
+  off = 0;
+  if (len < 14) return false;
+  if (!(data[0] == 'M' && data[1] == 'T' && data[2] == 'h' && data[3] == 'd')) return false;
+  uint32_t hdrLen = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
+  if (hdrLen < 6 || len < 8 + hdrLen) return false;
+  fmt = (uint16_t)((data[8] << 8) | data[9]);
+  ntrks = (uint16_t)((data[10] << 8) | data[11]);
+  division = (uint16_t)((data[12] << 8) | data[13]);
+  off = 8 + hdrLen;
+  return true;
+}
+static bool findTrackAt(const uint8_t* data, uint32_t len, uint32_t& off, uint32_t& trackLen) {
+  if (off + 8 > len) return false;
+  if (!(data[off + 0] == 'M' && data[off + 1] == 'T' && data[off + 2] == 'r' && data[off + 3] == 'k')) return false;
+  trackLen = (uint32_t)(data[off + 4] << 24) | (uint32_t)(data[off + 5] << 16) | (uint32_t)(data[off + 6] << 8) | (uint32_t)(data[off + 7]);
+  off += 8;
+  if (off + trackLen > len) return false;
+  return true;
+}
+static void buildTempoMapPass(const uint8_t* trk, uint32_t trkLen, uint32_t& outNoteOnCount, TempoEvent* tempo, uint32_t& tempoCount, uint32_t tempoMax, uint32_t& lastAbs) {
+  const uint8_t* p = trk;
+  const uint8_t* end = trk + trkLen;
+  uint8_t run = 0;
+  uint32_t absTicks = 0;
+  outNoteOnCount = 0;
+  lastAbs = 0;
+  while (p < end) {
+    bool ok = false;
+    uint32_t delta = vlq(p, end, ok);
+    if (!ok) break;
+    absTicks += delta;
+    if (p >= end) break;
+    uint8_t st = *p++;
+    if (st < 0x80) {
+      // running status
+      if (!run) break;
+      p--;  // step back to treat this byte as data for 'run'
+      st = run;
+    } else if (st < 0xF0) {
+      run = st;
+    }
+    if ((st & 0xF0) == 0x90) {
+      // note on
+      if (p + 1 > end) break;
+      uint8_t note = *p++;
+      uint8_t vel = *p++;
+      if (vel > 0) outNoteOnCount++;
+    } else if ((st & 0xF0) == 0x80) {
+      if (p + 1 > end) break;
+      p += 2;
+    } else if (st == 0xFF) {
+      if (p >= end) break;
+      uint8_t meta = *p++;
+      bool ok2 = false;
+      uint32_t ml = vlq(p, end, ok2);
+      if (!ok2 || p + ml > end) break;
+      if (meta == 0x51 && ml == 3) {
+        uint32_t uspb = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | (uint32_t)p[2];
+        // Record (coalesce/keep latest at same tick similarly to Node logic)
+        if (tempoCount < tempoMax) {
+          tempo[tempoCount].absTicks = absTicks;
+          tempo[tempoCount].usPerBeat = uspb;
+          tempoCount++;
+        }
+      }
+      p += ml;
+    } else {
+      // channel or system common
+      // 0xF0/0xF7 sysex: length then skip
+      if (st == 0xF0 || st == 0xF7) {
+        bool ok3 = false;
+        uint32_t sl = vlq(p, end, ok3);
+        if (!ok3 || p + sl > end) break;
+        p += sl;
+      } else {
+        // channel voice other than note on/off: assume two data bytes for safety for most
+        uint8_t hi = (st & 0xF0);
+        int need = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;  // program change, channel pressure have 1 data byte
+        if (p + need > end) break;
+        p += need;
+      }
+    }
+    lastAbs = absTicks;
+  }
+}
+static uint32_t ticksToMicrosWithTempo(uint32_t ticks, const TempoEvent* tempo, uint32_t tempoCount, uint16_t tpq) {
+  // integrate piecewise from 0..ticks with tempo changes (default 500000 us/qn at tick 0)
+  uint32_t us = 0;
+  uint32_t prevTick = 0;
+  uint32_t curUsPerBeat = 500000;
+  // Build a scan: tempo is not guaranteed sorted here; we’ll copy into a tiny sorted order by insertion (tempoCount small)
+  // For safety without heap, do a single-pass bubble-like sweep up to small count.
+  // Note: tempoCount capacity is bounded; this is fine.
+  for (uint32_t i = 0; i + 1 < tempoCount; ++i) {
+    for (uint32_t j = i + 1; j < tempoCount; ++j) {
+      if (tempo[j].absTicks < tempo[i].absTicks) {
+        // cannot swap const; ignore, we’ll process unsorted by repeated scan below
+      }
+    }
+  }
+  // We cannot reorder in place (const), so we compute on-the-fly by finding next change each step
+  // Simple linear pass: Walk tempo[i] in sorted-by-absTicks order.
+  // Since we pushed in chronological order during parse, it's already non-decreasing across tracks, but coalescing same-tick last wins.
+  prevTick = 0;
+  curUsPerBeat = 500000;
+  for (uint32_t i = 0; i < tempoCount; ++i) {
+    uint32_t tTick = tempo[i].absTicks;
+    if (tTick > ticks) break;
+    if (tTick > prevTick) {
+      uint32_t dt = tTick - prevTick;
+      us += (uint32_t)((uint64_t)dt * (uint64_t)curUsPerBeat / (uint64_t)tpq);
+      prevTick = tTick;
+    }
+    curUsPerBeat = tempo[i].usPerBeat;  // tempo at this tick takes effect from here onward
+  }
+  if (ticks > prevTick) {
+    uint32_t dt = ticks - prevTick;
+    us += (uint32_t)((uint64_t)dt * (uint64_t)curUsPerBeat / (uint64_t)tpq);
+  }
+  return us;
+}
+
+// Main entry: ensure .coplm exists for a given MIDI file and optionally play it via PlayOps.
+// Returns true on success; false on parse/FS/play error.
+//
+// Parameters:
+//   fs          - bind to activeFs.* (exists, getFileSize, readFile, writeFile)
+//   midiName    - MIDI filename in SimpleFS (<= 32 chars).
+//   buzzPin     - buzzer GPIO
+//   ledPin      - LED GPIO (may be same or different; used as activity indicator in scripts)
+//   trackOpt    - -1 to auto-pick track with most noteOn; otherwise track index (0-based)
+//   gapMs       - pause between notes (default 20 used by Node tool; you choose)
+//   maxLines    - CoProcLang max lines per chunk (e.g., 3712 like Node tool)
+//   maxSplits   - bounds #parts
+//   play        - callback to send one full script text to coprocessor
+//   work        - caller-supplied scratch buffer
+//   workCap     - size of work buffer; must be >= MIDI file size
+//   writeMode   - FS write mode; pass fsReplaceMode() from your activeFs binding
+//   timeoutMs   - per-script execution timeout for callback
+//
+// Behavior:
+//   - If "<base>.coplm" exists, we skip re-processing (we still play it).
+//   - If it doesn't exist, we parse the MIDI file and produce the .coplm file, then play it.
+//   - Playback: stream one script per chunk to play->playScriptText() (no temp .cpl files).
+static bool midiEnsureCoplmAndPlay(FsOps& fs, PlayOps& play,
+                                   const char* midiName,
+                                   int buzzPin, int ledPin, int trackOpt, int gapMs,
+                                   uint32_t maxLines, uint32_t maxSplits,
+                                   char* work, uint32_t workCap,
+                                   int writeMode,
+                                   uint32_t timeoutMs) {
+  if (!midiName || !fs.getFileSize || !fs.readFile || !fs.writeFile || !work) return false;
+  // 1) Read MIDI to work buffer
+  uint32_t midiSize = 0;
+  if (!fs.getFileSize(midiName, midiSize) || midiSize == 0) return false;
+  if (midiSize > workCap) return false;
+  if (fs.readFile(midiName, (uint8_t*)work, midiSize) != midiSize) return false;
+  const uint8_t* data = (const uint8_t*)work;
+  uint32_t len = midiSize;
+
+  // 2) Parse header
+  uint16_t fmt = 0, ntrks = 0, division = 0;
+  uint32_t off = 0;
+  if (!parseHeaderSMF(data, len, fmt, ntrks, division, off)) return false;
+  if ((division & 0x8000) != 0) {
+    // SMPTE not supported
+    return false;
+  }
+  uint16_t tpq = division;
+  if (tpq == 0) return false;
+
+  if (ntrks > COPROCLANG_MIDI_MAX_TRACKS) ntrks = COPROCLANG_MIDI_MAX_TRACKS;
+
+  // 3) First pass: gather tempo across all tracks + count note-ons per track
+  TempoEvent tempo[COPROCLANG_MIDI_MAX_TEMPO_EVENTS + 1];
+  uint32_t tempoCount = 0;
+  // Insert default 500000 at tick 0
+  tempo[tempoCount].absTicks = 0;
+  tempo[tempoCount].usPerBeat = 500000;
+  tempoCount++;
+
+  uint32_t trackNoteOnCounts[COPROCLANG_MIDI_MAX_TRACKS];
+  for (uint16_t i = 0; i < ntrks; ++i) trackNoteOnCounts[i] = 0;
+
+  uint32_t trkOff = off;
+  for (uint16_t i = 0; i < ntrks; ++i) {
+    uint32_t trkLen = 0;
+    if (!findTrackAt(data, len, trkOff, trkLen)) return false;
+    uint32_t tmpCount = 0;
+    uint32_t lastAbs = 0;
+    buildTempoMapPass(&data[trkOff], trkLen, tmpCount, tempo, tempoCount, COPROCLANG_MIDI_MAX_TEMPO_EVENTS, lastAbs);
+    trackNoteOnCounts[i] = tmpCount;
+    trkOff += trkLen;
+  }
+
+  // Track selection
+  int selIndex = trackOpt;
+  if (selIndex < 0) {
+    int best = -1;
+    uint32_t bestC = 0;
+    for (uint16_t i = 0; i < ntrks; ++i) {
+      if (trackNoteOnCounts[i] > bestC) {
+        bestC = trackNoteOnCounts[i];
+        best = (int)i;
+      }
+    }
+    selIndex = best;
+  }
+  if (selIndex < 0 || selIndex >= (int)ntrks) return false;
+
+  // 4) Second pass: parse selected track and build monophonic note durations -> store in .coplm
+  // We'll parse the selected track twice: first to count output notes, then to fill the .coplm body.
+  auto parseSelectedTrackMonoCount = [&](uint32_t& outNotesCount) -> bool {
+    outNotesCount = 0;
+    // Locate selected track again
+    uint32_t scanOff = off;
+    for (int i = 0; i < selIndex; ++i) {
+      uint32_t tl = 0;
+      if (!findTrackAt(data, len, scanOff, tl)) return false;
+      scanOff += tl;
+    }
+    uint32_t trkLen = 0;
+    uint32_t selTrackStart = scanOff;
+    if (!findTrackAt(data, len, scanOff, trkLen)) return false;
+    const uint8_t* p = &data[scanOff];
+    const uint8_t* end = p + trkLen;
+    uint8_t run = 0;
+    uint32_t absTicks = 0;
+
+    // Mono reduction state
+    int currentNote = -1;
+    uint32_t currentStart = 0;
+    bool currentActive = false;
+
+    while (p < end) {
+      bool ok = false;
+      uint32_t delta = vlq(p, end, ok);
+      if (!ok) break;
+      absTicks += delta;
+      if (p >= end) break;
+      uint8_t st = *p++;
+      if (st < 0x80) {
+        if (!run) break;
+        p--;
+        st = run;
+      } else if (st < 0xF0) {
+        run = st;
+      }
+      if ((st & 0xF0) == 0x90) {
+        if (p + 1 > end) break;
+        uint8_t note = *p++;
+        uint8_t vel = *p++;
+        if (vel > 0) {
+          // preempt current
+          if (currentActive) {
+            uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+            uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+            if (endUs > startUs) outNotesCount++;
+          }
+          currentNote = note;
+          currentStart = absTicks;
+          currentActive = true;
+        } else {
+          // velocity=0 => off
+          if (currentActive && currentNote == note) {
+            uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+            uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+            if (endUs > startUs) outNotesCount++;
+            currentActive = false;
+          }
+        }
+      } else if ((st & 0xF0) == 0x80) {
+        if (p + 1 > end) break;
+        uint8_t note = *p++;
+        (void)*p++;  // vel
+        if (currentActive && currentNote == (int)note) {
+          uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+          uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+          if (endUs > startUs) outNotesCount++;
+          currentActive = false;
+        }
+      } else if (st == 0xFF) {
+        if (p >= end) break;
+        uint8_t meta = *p++;
+        bool ok2 = false;
+        uint32_t ml = vlq(p, end, ok2);
+        if (!ok2 || p + ml > end) break;
+        p += ml;
+      } else {
+        if (st == 0xF0 || st == 0xF7) {
+          bool ok3 = false;
+          uint32_t sl = vlq(p, end, ok3);
+          if (!ok3 || p + sl > end) break;
+          p += sl;
+        } else {
+          uint8_t hi = (st & 0xF0);
+          int need = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+          if (p + need > end) break;
+          p += need;
+        }
+      }
+    }
+    // close remaining
+    if (currentActive) {
+      // Track end is absTicks of last event; no new end; drop it
+      // We'll ignore unfinished trailing note (no explicit off and no preempt) => set end to last absTicks
+      uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+      uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+      if (endUs > startUs) outNotesCount++;
+    }
+    return true;
+  };
+
+  uint32_t outNotes = 0;
+  if (!parseSelectedTrackMonoCount(outNotes)) return false;
+
+  // Build .coplm in-place into a small local structure and write to FS
+  // Layout: header then note entries
+  struct CoplmHeaderLocal {
+    char magic[4];
+    uint8_t version;
+    uint8_t reserved;
+    uint16_t flags;
+    uint32_t buzzPin;
+    uint32_t ledPin;
+    uint32_t gapMs;
+    uint32_t notesCount;
+  } hdr;
+
+  hdr.magic[0] = 'C';
+  hdr.magic[1] = 'P';
+  hdr.magic[2] = 'L';
+  hdr.magic[3] = 'M';
+  hdr.version = 1;
+  hdr.reserved = 0;
+  hdr.flags = 0;
+  hdr.buzzPin = (uint32_t)buzzPin;
+  hdr.ledPin = (uint32_t)ledPin;
+  hdr.gapMs = (uint32_t)((gapMs < 0) ? 0 : gapMs);
+  hdr.notesCount = outNotes;
+
+  // Build filename
+  char coplmName[40];
+  makeCoplmName(coplmName, sizeof(coplmName), midiName);
+
+  bool haveCoplm = false;
+  if (fs.exists) {
+    haveCoplm = fs.exists(coplmName);
+  }
+
+  if (!haveCoplm) {
+    // Fill an output buffer (small chunk assemble)
+    // .coplm is small: header + N*(8 bytes) (1+7 padded). outNotes is moderate for small tunes.
+    // Compose into a temporary stack buffer if small; otherwise reuse work buffer to avoid heap.
+    uint32_t coplmBytes = sizeof(CoplmHeaderLocal) + outNotes * sizeof(CoplmNoteEntry);
+    if (coplmBytes > workCap) return false;
+    uint8_t* outBuf = (uint8_t*)work;
+    memcpy(outBuf, &hdr, sizeof(hdr));
+    CoplmNoteEntry* entries = (CoplmNoteEntry*)(outBuf + sizeof(hdr));
+    // Fill entries by parsing again
+    // Locate selected track again
+    uint32_t scanOff = off;
+    for (int i = 0; i < selIndex; ++i) {
+      uint32_t tl = 0;
+      if (!findTrackAt(data, len, scanOff, tl)) return false;
+      scanOff += tl;
+    }
+    uint32_t trkLen = 0;
+    if (!findTrackAt(data, len, scanOff, trkLen)) return false;
+    const uint8_t* p = &data[scanOff];
+    const uint8_t* end = p + trkLen;
+    uint8_t run = 0;
+    uint32_t absTicks = 0;
+    int currentNote = -1;
+    uint32_t currentStart = 0;
+    bool currentActive = false;
+    uint32_t outIdx = 0;
+
+    while (p < end) {
+      bool ok = false;
+      uint32_t delta = vlq(p, end, ok);
+      if (!ok) break;
+      absTicks += delta;
+      if (p >= end) break;
+      uint8_t st = *p++;
+      if (st < 0x80) {
+        if (!run) break;
+        p--;
+        st = run;
+      } else if (st < 0xF0) {
+        run = st;
+      }
+      if ((st & 0xF0) == 0x90) {
+        if (p + 1 > end) break;
+        uint8_t note = *p++;
+        uint8_t vel = *p++;
+        if (vel > 0) {
+          if (currentActive) {
+            uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+            uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+            if (endUs > startUs && outIdx < outNotes) {
+              entries[outIdx].note = (uint8_t)currentNote;
+              entries[outIdx].reserved0 = 0;
+              entries[outIdx].reserved1 = 0;
+              entries[outIdx].dur_us = endUs - startUs;
+              outIdx++;
+            }
+          }
+          currentNote = note;
+          currentStart = absTicks;
+          currentActive = true;
+        } else {
+          if (currentActive && currentNote == note) {
+            uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+            uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+            if (endUs > startUs && outIdx < outNotes) {
+              entries[outIdx].note = (uint8_t)currentNote;
+              entries[outIdx].reserved0 = 0;
+              entries[outIdx].reserved1 = 0;
+              entries[outIdx].dur_us = endUs - startUs;
+              outIdx++;
+            }
+            currentActive = false;
+          }
+        }
+      } else if ((st & 0xF0) == 0x80) {
+        if (p + 1 > end) break;
+        uint8_t note = *p++;
+        (void)*p++;
+        if (currentActive && currentNote == (int)note) {
+          uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+          uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+          if (endUs > startUs && outIdx < outNotes) {
+            entries[outIdx].note = (uint8_t)currentNote;
+            entries[outIdx].reserved0 = 0;
+            entries[outIdx].reserved1 = 0;
+            entries[outIdx].dur_us = endUs - startUs;
+            outIdx++;
+          }
+          currentActive = false;
+        }
+      } else if (st == 0xFF) {
+        if (p >= end) break;
+        uint8_t meta = *p++;
+        bool ok2 = false;
+        uint32_t ml = vlq(p, end, ok2);
+        if (!ok2 || p + ml > end) break;
+        p += ml;
+      } else {
+        if (st == 0xF0 || st == 0xF7) {
+          bool ok3 = false;
+          uint32_t sl = vlq(p, end, ok3);
+          if (!ok3 || p + sl > end) break;
+          p += sl;
+        } else {
+          uint8_t hi = (st & 0xF0);
+          int need = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+          if (p + need > end) break;
+          p += need;
+        }
+      }
+    }
+    // close if needed
+    if (currentActive && outIdx < outNotes) {
+      // end at last absTicks we saw
+      uint32_t startUs = ticksToMicrosWithTempo(currentStart, tempo, tempoCount, tpq);
+      uint32_t endUs = ticksToMicrosWithTempo(absTicks, tempo, tempoCount, tpq);
+      if (endUs > startUs) {
+        entries[outIdx].note = (uint8_t)currentNote;
+        entries[outIdx].reserved0 = 0;
+        entries[outIdx].reserved1 = 0;
+        entries[outIdx].dur_us = endUs - startUs;
+        outIdx++;
+      }
+    }
+    // fix count if we had some zero/neg filters
+    ((CoplmHeaderLocal*)outBuf)->notesCount = outIdx;
+    // Write .coplm
+    if (!fs.writeFile(coplmName, outBuf, sizeof(hdr) + outIdx * sizeof(CoplmNoteEntry), writeMode)) {
+      return false;
+    }
+  }
+
+  // 5) Playback: load .coplm from FS, then build scripts in chunks (<= maxLines) and stream them to coproc
+  if (!play.playScriptText) return true;  // nothing to do if no playback
+  // Read .coplm back (small)
+  uint32_t coplmSize = 0;
+  if (!fs.getFileSize(coplmName, coplmSize) || coplmSize < sizeof(CoplmHeaderLocal)) return false;
+  if (coplmSize > workCap) return false;
+  if (fs.readFile(coplmName, (uint8_t*)work, coplmSize) != coplmSize) return false;
+  CoplmHeaderLocal* H = (CoplmHeaderLocal*)work;
+  if (!(H->magic[0] == 'C' && H->magic[1] == 'P' && H->magic[2] == 'L' && H->magic[3] == 'M')) return false;
+  if (H->version != 1) return false;
+  uint32_t N = H->notesCount;
+  if (sizeof(CoplmHeaderLocal) + N * sizeof(CoplmNoteEntry) > coplmSize) return false;
+  CoplmNoteEntry* E = (CoplmNoteEntry*)((uint8_t*)work + sizeof(CoplmHeaderLocal));
+
+  // Chunking by line count. Per-note lines:
+  const uint32_t perNoteLines = 12 + ((gapMs > 0) ? 1u : 0u);
+  const uint32_t headerLines = 5;
+  const uint32_t footerLines = 2;
+
+  // quick lambda to estimate max notes per chunk
+  auto notesPerChunk = [&](uint32_t maxLines) -> uint32_t {
+    if (maxLines <= headerLines + footerLines) return 0;
+    uint32_t room = maxLines - (headerLines + footerLines);
+    uint32_t k = room / (perNoteLines ? perNoteLines : 1);
+    return (k > 0) ? k : 1;
+  };
+  uint32_t npc = notesPerChunk(maxLines);
+  if (npc == 0) npc = 1;
+  uint32_t parts = (N + npc - 1) / npc;
+  if (parts == 0) parts = 1;
+  if (parts > maxSplits) {
+    // too many splits requested; adjust to allowed max by increasing notes per chunk
+    npc = (N + maxSplits - 1) / maxSplits;
+    parts = (N + npc - 1) / npc;
+  }
+
+  // Build and play each part as CoProcLang text
+  // We'll render into an internal stack buffer in small-ish chunks to keep RAM low.
+  // However the whole script string must be contiguous for the callback. Choose a modest cap; your ExecHost will stream chunks anyway.
+  const size_t SCRIPT_BUF = 4096;
+  char* sbuf = (char*)work;  // re-use the same buffer if large enough
+  size_t sbufCap = (size_t)workCap;
+  if (sbufCap < SCRIPT_BUF) return false;
+
+  auto emitLine = [&](char* dst, size_t cap, size_t& off, const char* s) -> bool {
+    size_t L = strlen(s);
+    if (off + L + 1 >= cap) return false;
+    memcpy(dst + off, s, L);
+    off += L;
+    dst[off++] = '\n';
+    dst[off] = 0;
+    return true;
+  };
+
+  auto buildAndPlayPart = [&](uint32_t startIndex, uint32_t count, uint32_t partIndex, uint32_t totalParts) -> bool {
+    size_t offS = 0;
+    // Header
+    char line[96];
+    snprintf(line, sizeof(line), "# Generated by midi2coproc (embedded) PART %lu/%lu", (unsigned long)(partIndex + 1), (unsigned long)totalParts);
+    if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+    snprintf(line, sizeof(line), "PINMODE %d OUT", buzzPin);
+    if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+    snprintf(line, sizeof(line), "PINMODE %d OUT", ledPin);
+    if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+    if (!emitLine(sbuf, sbufCap, offS, "MBCLR")) return false;
+    snprintf(line, sizeof(line), "DWRITE %d 0", ledPin);
+    if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+
+    uint32_t localNotes = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      const CoplmNoteEntry& en = E[startIndex + i];
+      if (en.dur_us == 0) continue;
+      // compute half-period and cycles
+      double f = midiNoteToFreq((int)en.note);
+      if (f < 1.0) f = 1.0;
+      uint32_t halfPeriod = (uint32_t)((1000000.0 / (2.0 * f)) + 0.5);
+      if (halfPeriod == 0) halfPeriod = 1;
+      // Ensure at least 1 cycle
+      uint32_t cycles = (uint32_t)((double)en.dur_us / (double)(2ULL * (uint64_t)halfPeriod));
+      if (cycles == 0) cycles = 1;
+
+      snprintf(line, sizeof(line), "# Note %u ~%.1fHz, ~%lums",
+               (unsigned)en.note, (float)f, (unsigned long)(en.dur_us / 1000u));
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      snprintf(line, sizeof(line), "LET R1 %lu", (unsigned long)halfPeriod);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      snprintf(line, sizeof(line), "LET R0 %lu", (unsigned long)cycles);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      snprintf(line, sizeof(line), "DWRITE %d 1", ledPin);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      char loopLabel[16];
+      snprintf(loopLabel, sizeof(loopLabel), "N%lu", (unsigned long)i);
+      snprintf(line, sizeof(line), "%s:", loopLabel);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      snprintf(line, sizeof(line), "DWRITE %d 1", buzzPin);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      if (!emitLine(sbuf, sbufCap, offS, "DELAY_US R1")) return false;
+      snprintf(line, sizeof(line), "DWRITE %d 0", buzzPin);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      if (!emitLine(sbuf, sbufCap, offS, "DELAY_US R1")) return false;
+      if (!emitLine(sbuf, sbufCap, offS, "SUB R0 1")) return false;
+      snprintf(line, sizeof(line), "IF R0 > 0 GOTO %s", loopLabel);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      snprintf(line, sizeof(line), "DWRITE %d 0", ledPin);
+      if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      if (gapMs > 0) {
+        snprintf(line, sizeof(line), "DELAY %d", gapMs);
+        if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+      }
+      localNotes++;
+    }
+    snprintf(line, sizeof(line), "MBAPP \"notes=%lu\"", (unsigned long)localNotes);
+    if (!emitLine(sbuf, sbufCap, offS, line)) return false;
+    if (!emitLine(sbuf, sbufCap, offS, "RET 0")) return false;
+
+    int32_t ret = 0;
+    if (!play.playScriptText(sbuf, (uint32_t)offS, timeoutMs, ret)) return false;
+    return true;
+  };
+
+  if (N == 0) {
+    // trivial no-note script to keep consistent
+    size_t offS = 0;
+    char* sbuf2 = (char*)work;
+    size_t cap = (size_t)workCap;
+    char line[96];
+    snprintf(line, sizeof(line), "# Generated by midi2coproc (embedded) - no notes");
+    auto emitLine2 = [&](const char* s) -> bool {
+      size_t L = strlen(s);
+      if (offS + L + 1 >= cap) return false;
+      memcpy(sbuf2 + offS, s, L);
+      offS += L;
+      sbuf2[offS++] = '\n';
+      sbuf2[offS] = 0;
+      return true;
+    };
+    if (!emitLine2(line)) return false;
+    snprintf(line, sizeof(line), "PINMODE %d OUT", buzzPin);
+    if (!emitLine2(line)) return false;
+    snprintf(line, sizeof(line), "PINMODE %d OUT", ledPin);
+    if (!emitLine2(line)) return false;
+    if (!emitLine2("MBCLR")) return false;
+    snprintf(line, sizeof(line), "DWRITE %d 0", ledPin);
+    if (!emitLine2(line)) return false;
+    if (!emitLine2("MBAPP \"notes=0\"")) return false;
+    if (!emitLine2("RET 0")) return false;
+    int32_t ret = 0;
+    return play.playScriptText(sbuf2, (uint32_t)offS, timeoutMs, ret);
+  }
+
+  uint32_t done = 0;
+  for (uint32_t part = 0; part < parts; ++part) {
+    uint32_t remain = (N - done);
+    uint32_t take = (remain > npc) ? npc : remain;
+    if (!buildAndPlayPart(done, take, part, parts)) return false;
+    done += take;
+  }
+  return true;
+}
+
 }  // namespace CoProcLang

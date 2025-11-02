@@ -1,6 +1,11 @@
 // main_psram_flash_switch_exec_loader.ino
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
+// Force low identification speed compatible with the bridge
+#define UNIFIED_SPI_INSTANCE SPI1
+#define UNIFIED_SPI_CLOCK_HZ 50000UL  // 50 kHz
+#define W25Q_SPI_CLOCK_HZ 50000UL     // NOR ID speed
+#define MX35_SPI_CLOCK_HZ 50000UL     // NAND ID speed
 #include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
@@ -56,12 +61,13 @@ const uint8_t PIN_FLASH_MOSI = 11;  // GP11
 const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
 const uint8_t PIN_FLASH_SCK = 10;   // GP10
 const uint8_t PIN_PSRAM_SCK = 10;   // GP10
-const uint8_t PIN_FLASH_CS = 9;     // GP9
+const uint8_t PIN_FLASH_CS0 = 9;    // GP9
 const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
 const uint8_t PIN_PSRAM_CS1 = 15;   // GP15
 const uint8_t PIN_PSRAM_CS2 = 26;   // GP26
 const uint8_t PIN_PSRAM_CS3 = 27;   // GP27
 const uint8_t PIN_NAND_CS = 28;     // GP28
+const uint8_t PIN_FLASH_CS1 = 29;   // GP29
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
@@ -890,1138 +896,17 @@ static void updateExecFsTable() {
   //t.deleteFile = activeFs.deleteFile;
   Exec.attachFS(t);
 }
-// ================= Memory Diagnostics =================
-#ifdef ARDUINO_ARCH_RP2040
-extern "C" {
-  extern char __StackTop;
-  extern char __StackBottom;
-}
-#include "unistd.h"
-static uint32_t freeStackCurrentCoreApprox() {
-  volatile uint8_t marker;
-  uintptr_t sp = (uintptr_t)&marker;
-  uintptr_t top = (uintptr_t)&__StackTop;
-  uintptr_t bottom = (uintptr_t)&__StackBottom;
-  if (top > bottom && sp >= bottom && sp <= top) {
-    return (uint32_t)(sp - bottom);
-  }
-  void* heapEnd = sbrk(0);
-  intptr_t gap = (intptr_t)sp - (intptr_t)heapEnd;
-  return (gap > 0) ? (uint32_t)gap : 0u;
-}
-#else
-static uint32_t freeStackCurrentCoreApprox() {
-  volatile uint8_t marker;
-  void* heapEnd = sbrk(0);
-  intptr_t gap = (intptr_t)&marker - (intptr_t)heapEnd;
-  return (gap > 0) ? (uint32_t)gap : 0u;
-}
-#endif
-#ifdef ARDUINO_ARCH_RP2040
-static void printStackInfo() {
-  volatile uint8_t marker;
-  uintptr_t sp = (uintptr_t)&marker;
-  uintptr_t top = (uintptr_t)&__StackTop;
-  uintptr_t bottom = (uintptr_t)&__StackBottom;
-  if (top > bottom && sp >= bottom && sp <= top) {
-    uint32_t total = (uint32_t)(top - bottom);
-    uint32_t used = (uint32_t)(top - sp);
-    uint32_t free = (uint32_t)(sp - bottom);
-    Console.printf("Stack total=%u used=%u free=%u bytes\n", total, used, free);
-    return;
-  }
-  Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
-}
-#endif
-// ========== FS helpers and console ==========
-static bool checkNameLen(const char* name) {
-  size_t n = strlen(name);
-  if (n == 0 || n > ActiveFS::MAX_NAME) {
-    Console.print("Error: filename length ");
-    Console.print(n);
-    Console.print(" exceeds max ");
-    Console.print(ActiveFS::MAX_NAME);
-    Console.println(". Use a shorter name.");
-    return false;
-  }
-  return true;
-}
-static void listBlobs() {
-  Console.println("Available blobs:");
-  for (size_t i = 0; i < g_blobs_count; ++i) {
-    Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
-  }
-}
-static const BlobReg* findBlob(const char* id) {
-  for (size_t i = 0; i < g_blobs_count; ++i)
-    if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
-  return nullptr;
-}
-static void dumpFileHead(const char* fname, uint32_t count) {
-  uint32_t sz = 0;
-  if (!activeFs.getFileSize(fname, sz) || sz == 0) {
-    Console.println("dump: missing/empty");
-    return;
-  }
-  if (count > sz) count = sz;
-  const size_t CHUNK = 32;
-  uint8_t buf[CHUNK];
-  uint32_t off = 0;
-  Console.print(fname);
-  Console.print(" size=");
-  Console.println(sz);
-  while (off < count) {
-    size_t n = (count - off > CHUNK) ? CHUNK : (count - off);
-    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
-    if (got != n) {
-      Console.println("  read error");
-      break;
-    }
-    Console.print("  ");
-    for (size_t i = 0; i < n; ++i) {
-      if (i) Console.print(' ');
-      if (buf[i] < 0x10) Console.print('0');
-      Console.print(buf[i], HEX);
-    }
-    Console.println();
-    off += n;
-  }
-}
-static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
-  if (!checkNameLen(fname)) return false;
-  uint32_t eraseAlign = getEraseAlign();
-  if (reserve < eraseAlign) reserve = eraseAlign;
-  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
-  if (!activeFs.exists(fname)) {
-    Console.print("Creating slot ");
-    Console.print(fname);
-    Console.print(" (");
-    Console.print(reserve);
-    Console.println(" bytes)...");
-    if (activeFs.createFileSlot(fname, reserve, data, len)) {
-      Console.println("Created and wrote blob");
-      return true;
-    }
-    Console.println("Failed to create slot");
-    return false;
-  }
-  uint32_t addr, size, cap;
-  if (!activeFs.getFileInfo(fname, addr, size, cap)) {
-    Console.println("getFileInfo failed");
-    return false;
-  }
-  bool same = (size == len);
-  if (same) {
-    const size_t CHUNK = 64;
-    uint8_t buf[CHUNK];
-    uint32_t off = 0;
-    while (off < size) {
-      size_t n = (size - off > CHUNK) ? CHUNK : (size - off);
-      activeFs.readFileRange(fname, off, buf, n);
-      for (size_t i = 0; i < n; ++i) {
-        if (buf[i] != data[off + i]) {
-          same = false;
-          break;
-        }
-      }
-      if (!same) break;
-      off += n;
-      yield();
-    }
-  }
-  if (same) {
-    Console.println("Blob already up to date");
-    return true;
-  }
-  if (cap >= len && activeFs.writeFileInPlace(fname, data, len, false)) {
-    Console.println("Updated in place");
-    return true;
-  }
-  if (activeFs.writeFile(fname, data, len, fsReplaceMode())) {
-    Console.println("Updated by allocating new space");
-    return true;
-  }
-  Console.println("Failed to update file");
-  return false;
-}
-static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
-  if (!checkNameLen(fname)) return false;
-  if (activeFs.exists(fname)) {
-    Console.printf("Skipping: %s\n", fname);
-    return true;
-  }
-  uint32_t eraseAlign = getEraseAlign();
-  if (reserve < eraseAlign) reserve = eraseAlign;
-  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
-  Console.printf("Auto-creating %s (%lu bytes)...\n", fname, (unsigned long)reserve);
-  if (activeFs.createFileSlot(fname, reserve, data, len)) {
-    Console.println("Created and wrote blob");
-    return true;
-  }
-  Console.println("Auto-create failed");
-  return false;
-}
-static void autogenBlobWrites() {
-  bool allOk = true;
-  allOk &= ensureBlobIfMissing(FILE_RET42, blob_ret42, blob_ret42_len);
-  allOk &= ensureBlobIfMissing(FILE_ADD2, blob_add2, blob_add2_len);
-  allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
-  allOk &= ensureBlobIfMissing(FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len);
-  allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
-  allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
-  allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
-  allOk &= ensureBlobIfMissing(FILE_SONG, blob_song, blob_song_len);
-  allOk &= ensureBlobIfMissing(FILE_PT1, blob_pt1, blob_pt1_len);
-  allOk &= ensureBlobIfMissing(FILE_PT2, blob_pt2, blob_pt2_len);
-  allOk &= ensureBlobIfMissing(FILE_PT3, blob_pt3, blob_pt3_len);
-  Console.print("Autogen:  ");
-  Console.println(allOk ? "OK" : "some failures");
-}
-// ========== PSRAM diagnostics using UnifiedSPIMem ==========
-static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = Serial) {
-  size_t banks = 0;
-  uint64_t total = 0;
-  out.println();
-  out.println("PSRAM capacity report (Unified):");
-  for (size_t i = 0; i < mgr.detectedCount(); ++i) {
-    const auto* di = mgr.detectedInfo(i);
-    if (!di || di->type != UnifiedSpiMem::DeviceType::Psram) continue;
-    banks++;
-    total += di->capacityBytes;
-    out.print("  Bank ");
-    out.print(banks - 1);
-    out.print(" (CS=");
-    out.print(di->cs);
-    out.print(")  Vendor=");
-    out.print(di->vendorName);
-    out.print("  Cap=");
-    out.print((unsigned long)di->capacityBytes);
-    out.print(" bytes");
-    if (di->partHint) {
-      out.print("  Part=");
-      out.print(di->partHint);
-    }
-    out.print("  JEDEC:");
-    for (uint8_t k = 0; k < di->jedecLen; ++k) {
-      out.print(' ');
-      if (di->jedec[k] < 16) out.print('0');
-      out.print(di->jedec[k], HEX);
-    }
-    out.println();
-  }
-  out.print("Banks: ");
-  out.println((unsigned)banks);
-  out.print("Total: ");
-  out.print((unsigned long)total);
-  out.print(" bytes (");
-  out.print((unsigned long)(total / (1024UL * 1024UL)));
-  out.println(" MB)");
-  out.println();
-}
-static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
-  auto* dev = fs.raw().device();
-  if (!dev || dev->type() != UnifiedSpiMem::DeviceType::Psram) {
-    out.println("PSRAM smoke test: PSRAM device not open");
-    return;
-  }
-  const uint64_t cap = dev->capacity();
-  if (cap < 1024) {
-    out.println("PSRAM smoke test: capacity too small");
-    return;
-  }
-  const uint32_t fsHead = fs.raw().nextDataAddr();
-  const uint32_t dataStart = fs.raw().dataRegionStart();
-  const uint32_t TEST_SIZE = 1024;
-  uint64_t testAddr = fsHead + 4096;
-  if (testAddr + TEST_SIZE > cap) {
-    if (cap > TEST_SIZE) testAddr = cap - TEST_SIZE;
-    else testAddr = 0;
-  }
-  testAddr = (testAddr + 0xFF) & ~0xFFull;
-  if (testAddr < dataStart) testAddr = dataStart;
-  out.print("PSRAM smoke test @ 0x");
-  out.print((unsigned long)testAddr, HEX);
-  out.print(" size=");
-  out.print(TEST_SIZE);
-  out.println(" bytes");
-  uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
-  uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
-  if (!original || !verify) {
-    out.println("malloc failed for buffers");
-    if (original) free(original);
-    if (verify) free(verify);
-    return;
-  }
-  if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
-    out.println("read (backup) failed");
-    free(original);
-    free(verify);
-    return;
-  }
-  memset(verify, 0xAA, TEST_SIZE);
-  if (!dev->write(testAddr, verify, TEST_SIZE)) {
-    out.println("write pattern 0xAA failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  memset(verify, 0x00, TEST_SIZE);
-  if (dev->read(testAddr, verify, TEST_SIZE) != TEST_SIZE) {
-    out.println("readback (0xAA) failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  bool okAA = true;
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    if (verify[i] != 0xAA) {
-      okAA = false;
-      break;
-    }
-    if ((i & 63) == 0) yield();
-  }
-  out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
-  }
-  if (!dev->write(testAddr, verify, TEST_SIZE)) {
-    out.println("write pattern addr^0x5A failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  uint8_t* rb = (uint8_t*)malloc(TEST_SIZE);
-  if (!rb) {
-    out.println("malloc failed for readback");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  if (dev->read(testAddr, rb, TEST_SIZE) != TEST_SIZE) {
-    out.println("readback (addr^0x5A) failed");
-    free(rb);
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  bool okAddr = true;
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    uint8_t exp = (uint8_t)((testAddr + i) ^ 0x5A);
-    if (rb[i] != exp) {
-      okAddr = false;
-      break;
-    }
-    if ((i & 63) == 0) yield();
-  }
-  out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
-  free(rb);
-  if (!dev->write(testAddr, original, TEST_SIZE)) {
-    out.println("restore failed (data left with test pattern)");
-  } else {
-    out.println("restore OK");
-  }
-  free(original);
-  free(verify);
-}
-// ========== Binary upload helpers (single-line puthex/putb64) ==========
-static inline int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
-  out = nullptr;
-  outLen = 0;
-  if (!hex) return false;
-  size_t n = strlen(hex);
-  if (n == 0) return false;
-  if (n & 1) {
-    Console.println("puthex: error: hex string length is odd");
-    return false;
-  }
-  uint32_t bytes = (uint32_t)(n / 2);
-  uint8_t* buf = (uint8_t*)malloc(bytes);
-  if (!buf) {
-    Console.println("puthex: malloc failed");
-    return false;
-  }
-  for (uint32_t i = 0; i < bytes; ++i) {
-    int hi = hexVal(hex[2 * i + 0]), lo = hexVal(hex[2 * i + 1]);
-    if (hi < 0 || lo < 0) {
-      Console.println("puthex: invalid hex character");
-      free(buf);
-      return false;
-    }
-    buf[i] = (uint8_t)((hi << 4) | lo);
-  }
-  out = buf;
-  outLen = bytes;
-  return true;
-}
-static int8_t b64Map[256];
-static void initB64MapOnce() {
-  static bool inited = false;
-  if (inited) return;
-  for (int i = 0; i < 256; ++i) b64Map[i] = -1;
-  for (char c = 'A'; c <= 'Z'; ++c) b64Map[(uint8_t)c] = (int8_t)(c - 'A');
-  for (char c = 'a'; c <= 'z'; c++) b64Map[(uint8_t)c] = (int8_t)(26 + (c - 'a'));
-  for (char c = '0'; c <= '9'; c++) b64Map[(uint8_t)c] = (int8_t)(52 + (c - '0'));
-  b64Map[(uint8_t)'+'] = 62;
-  b64Map[(uint8_t)'/'] = 63;
-}
-static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
-  out = nullptr;
-  outLen = 0;
-  if (!s) return false;
-  initB64MapOnce();
-  size_t inLen = strlen(s);
-  uint32_t outCap = (uint32_t)(((inLen + 3) / 4) * 3);
-  uint8_t* buf = (uint8_t*)malloc(outCap ? outCap : 1);
-  if (!buf) {
-    Console.println("putb64: malloc failed");
-    return false;
-  }
-  uint32_t o = 0;
-  int vals[4];
-  int vCount = 0;
-  int pad = 0;
-  for (size_t i = 0; i < inLen; ++i) {
-    unsigned char c = (unsigned char)s[i];
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-    if (c == '=') {
-      vals[vCount++] = 0;
-      pad++;
-    } else {
-      int8_t v = b64Map[c];
-      if (v < 0) {
-        Console.println("putb64: invalid base64 character");
-        free(buf);
-        return false;
-      }
-      vals[vCount++] = v;
-    }
-    if (vCount == 4) {
-      uint32_t v0 = (uint32_t)vals[0], v1 = (uint32_t)vals[1], v2 = (uint32_t)vals[2], v3 = (uint32_t)vals[3];
-      uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
-      uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
-      uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
-      if (pad == 0) {
-        buf[o++] = b0;
-        buf[o++] = b1;
-        buf[o++] = b2;
-      } else if (pad == 1) {
-        buf[o++] = b0;
-        buf[o++] = b1;
-      } else if (pad == 2) {
-        buf[o++] = b0;
-      } else {
-        free(buf);
-        Console.println("putb64: invalid padding");
-        return false;
-      }
-      vCount = 0;
-      pad = 0;
-    }
-  }
-  if (vCount != 0) {
-    free(buf);
-    Console.println("putb64: truncated input");
-    return false;
-  }
-  out = buf;
-  outLen = o;
-  return true;
-}
-static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
-  if (!checkNameLen(fname)) return false;
-  bool ok = activeFs.writeFile(fname, data, len, fsReplaceMode());
-  return ok;
-}
-// ================= CompilerHelpers header =================
+
+#include "MemDiag.h"
+#include "BlobGen.h"
+#include "PSRAMDiag.h"
+#include "CoProcRPCHelpers.h"
+#include "NanoishTextEditor.h"
+#include "SHA256hashcmd.h"
+#include "Base64Utils.h"
+#include "InputHelper.h"
+#include "CrossFSUtils.h"
 #include "CompilerHelpers.h"
-// ===================== Co-Processor RPC helpers (for CMD_FUNC) =====================
-static uint32_t g_coproc_seq = 1;
-static bool coprocWriteAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
-  uint32_t start = millis();
-  size_t off = 0;
-  while (off < n) {
-    size_t w = coprocLink.write(src + off, n - off);
-    if (w > 0) {
-      off += w;
-      continue;
-    }
-    if ((millis() - start) > timeoutMs) return false;
-    yield();
-  }
-  coprocLink.flush();
-  return true;
-}
-static bool coprocReadByte(uint8_t& b, uint32_t timeoutMs) {
-  uint32_t start = millis();
-  while ((millis() - start) <= timeoutMs) {
-    int a = coprocLink.available();
-    if (a > 0) {
-      int v = coprocLink.read();
-      if (v >= 0) {
-        b = (uint8_t)v;
-        return true;
-      }
-    }
-    tight_loop_contents();
-    yield();
-  }
-  return false;
-}
-static bool coprocReadExact(uint8_t* dst, size_t n, uint32_t timeoutPerByteMs) {
-  for (size_t i = 0; i < n; ++i) {
-    if (!coprocReadByte(dst[i], timeoutPerByteMs)) return false;
-  }
-  return true;
-}
-static bool coprocCallFunc(const char* name, const int32_t* argv, uint32_t argc, int32_t& outResult) {
-  if (!name) return false;
-  uint32_t nameLen = (uint32_t)strlen(name);
-  if (nameLen == 0 || nameLen > 128) {
-    Console.println("coproc func: name length invalid (1..128)");
-    return false;
-  }
-  if (argc > MAX_EXEC_ARGS) argc = MAX_EXEC_ARGS;
-  const uint32_t payloadLen = 4 + nameLen + 4 + 4 * argc;
-  uint8_t payload[4 + 128 + 4 + 4 * MAX_EXEC_ARGS];
-  size_t off = 0;
-  CoProc::writePOD(payload, sizeof(payload), off, nameLen);
-  CoProc::writeBytes(payload, sizeof(payload), off, name, nameLen);
-  CoProc::writePOD(payload, sizeof(payload), off, argc);
-  for (uint32_t i = 0; i < argc; ++i) {
-    CoProc::writePOD(payload, sizeof(payload), off, argv[i]);
-  }
-  CoProc::Frame req{};
-  req.magic = CoProc::MAGIC;
-  req.version = CoProc::VERSION;
-  req.cmd = CoProc::CMD_FUNC;
-  req.seq = g_coproc_seq++;
-  req.len = payloadLen;
-  req.crc32 = (payloadLen ? CoProc::crc32_ieee(payload, payloadLen) : 0);
-  if (!coprocWriteAll(reinterpret_cast<const uint8_t*>(&req), sizeof(req), 2000)) {
-    Console.println("coproc func: write header failed");
-    return false;
-  }
-  if (payloadLen) {
-    if (!coprocWriteAll(payload, payloadLen, 10000)) {
-      Console.println("coproc func: write payload failed");
-      return false;
-    }
-  }
-  const uint8_t magicBytes[4] = { (uint8_t)('C'), (uint8_t)('P'), (uint8_t)('R'), (uint8_t)('0') };
-  uint8_t w[4] = { 0, 0, 0, 0 };
-  for (;;) {
-    uint8_t b = 0;
-    if (!coprocReadByte(b, 5000)) {
-      Console.println("coproc func: response timeout");
-      return false;
-    }
-    w[0] = w[1];
-    w[1] = w[2];
-    w[2] = w[3];
-    w[3] = b;
-    if (w[0] == magicBytes[0] && w[1] == magicBytes[1] && w[2] == magicBytes[2] && w[3] == magicBytes[3]) {
-      union {
-        CoProc::Frame f;
-        uint8_t bytes[sizeof(CoProc::Frame)];
-      } u;
-      memcpy(u.bytes, w, 4);
-      if (!coprocReadExact(u.bytes + 4, sizeof(CoProc::Frame) - 4, 200)) {
-        Console.println("coproc func: resp header tail timeout");
-        return false;
-      }
-      CoProc::Frame resp = u.f;
-      if ((resp.magic != CoProc::MAGIC) || (resp.version != CoProc::VERSION)) {
-        Console.println("coproc func: resp bad magic/version");
-        return false;
-      }
-      if (resp.cmd != (uint16_t)(CoProc::CMD_FUNC | 0x80)) {
-        Console.print("coproc func: unexpected resp cmd=0x");
-        Console.println(resp.cmd, HEX);
-        return false;
-      }
-      uint8_t buf[16];
-      if (resp.len > sizeof(buf)) {
-        Console.println("coproc func: resp too large");
-        uint32_t left = resp.len;
-        uint8_t sink[32];
-        while (left) {
-          uint32_t chunk = (left > sizeof(sink)) ? sizeof(sink) : left;
-          if (!coprocReadExact(sink, chunk, 200)) break;
-          left -= chunk;
-        }
-        return false;
-      }
-      if (resp.len) {
-        if (!coprocReadExact(buf, resp.len, 200)) {
-          Console.println("coproc func: resp payload timeout");
-          return false;
-        }
-        uint32_t crc = CoProc::crc32_ieee(buf, resp.len);
-        if (crc != resp.crc32) {
-          Console.print("coproc func: resp CRC mismatch exp=0x");
-          Console.print(resp.crc32, HEX);
-          Console.print(" got=0x");
-          Console.println(crc, HEX);
-          return false;
-        }
-      }
-      size_t rp = 0;
-      int32_t st = CoProc::ST_BAD_CMD;
-      int32_t rv = 0;
-      if (resp.len >= sizeof(int32_t)) {
-        CoProc::readPOD(buf, resp.len, rp, st);
-      }
-      if (resp.len >= 2 * sizeof(int32_t)) {
-        CoProc::readPOD(buf, resp.len, rp, rv);
-      }
-      if (st == CoProc::ST_OK) {
-        outResult = rv;
-        return true;
-      } else {
-        Console.print("coproc func: remote error status=");
-        Console.println(st);
-        return false;
-      }
-    }
-  }
-}
-// ----------------- Nano-like editor integration -----------------
-#include "TextEditor.h"
-
-// ================== Improved Console Line Editing with History ==================
-static const char* PROMPT = "> ";
-
-// Input buffer (keep using existing large buffer)
-static char lineBuf[FS_SECTOR_SIZE];
-
-// History (SRAM only)
-#define HISTORY_MAX 16
-#define HISTORY_ENTRY_MAX 192
-static char g_history[HISTORY_MAX][HISTORY_ENTRY_MAX];
-static int g_history_count = 0;                        // number of valid entries
-static int g_history_browse = -1;                      // -1 = not browsing; 0 = newest; increases as we go up
-static char g_saved_before_browse[HISTORY_ENTRY_MAX];  // buffer to restore when exiting browse
-static size_t g_saved_before_browse_len = 0;
-
-// Renderer state
-static size_t g_line_len = 0;
-static size_t g_cursor = 0;
-static size_t g_last_render_len = 0;
-
-// Minimal helpers
-static void historyPush(const char* s, size_t len) {
-  if (!s || len == 0) return;
-  // Avoid duplicate of last entry
-  if (g_history_count > 0) {
-    const char* last = g_history[g_history_count - 1];
-    if (strncmp(last, s, HISTORY_ENTRY_MAX - 1) == 0 && strlen(last) == len) return;
-  }
-  if (g_history_count < HISTORY_MAX) {
-    // append
-    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_history[g_history_count], s, L);
-    g_history[g_history_count][L] = 0;
-    g_history_count++;
-  } else {
-    // shift left
-    for (int i = 1; i < HISTORY_MAX; ++i) {
-      strncpy(g_history[i - 1], g_history[i], HISTORY_ENTRY_MAX);
-      g_history[i - 1][HISTORY_ENTRY_MAX - 1] = 0;
-    }
-    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_history[HISTORY_MAX - 1], s, L);
-    g_history[HISTORY_MAX - 1][L] = 0;
-  }
-}
-
-static void renderLine() {
-  // Move to start, print prompt + content, clear tail, then move cursor
-  Serial.write('\r');
-  Serial.print(PROMPT);
-  for (size_t i = 0; i < g_line_len; ++i) Serial.write(lineBuf[i]);
-  // Clear rest of previous render if shorter
-  size_t fullLen = g_line_len;
-  if (g_last_render_len > fullLen) {
-    size_t extra = g_last_render_len - fullLen;
-    for (size_t i = 0; i < extra; ++i) Serial.write(' ');
-  }
-  g_last_render_len = fullLen;
-  // Reposition to cursor
-  Serial.write('\r');
-  Serial.print(PROMPT);
-  for (size_t i = 0; i < g_cursor; ++i) Serial.write(lineBuf[i]);
-}
-
-static void setLineFrom(const char* s) {
-  if (!s) s = "";
-  size_t L = strlen(s);
-  if (L >= sizeof(lineBuf)) L = sizeof(lineBuf) - 1;
-  memcpy(lineBuf, s, L);
-  g_line_len = L;
-  lineBuf[g_line_len] = 0;
-  g_cursor = g_line_len;
-  renderLine();
-}
-
-static void beginBrowseIfNeeded() {
-  if (g_history_browse == -1) {
-    // save current edit buffer (for restore on down past newest)
-    size_t L = (g_line_len < (HISTORY_ENTRY_MAX - 1)) ? g_line_len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_saved_before_browse, lineBuf, L);
-    g_saved_before_browse[L] = 0;
-    g_saved_before_browse_len = L;
-  }
-}
-
-static void browseUp() {
-  if (g_history_count == 0) return;
-  beginBrowseIfNeeded();
-  if (g_history_browse < (g_history_count - 1)) {
-    g_history_browse++;
-    int idx = g_history_count - 1 - g_history_browse;
-    setLineFrom(g_history[idx]);
-  }
-}
-
-static void browseDown() {
-  if (g_history_browse < 0) return;
-  if (g_history_browse > 0) {
-    g_history_browse--;
-    int idx = g_history_count - 1 - g_history_browse;
-    setLineFrom(g_history[idx]);
-  } else {
-    // exit browse, restore saved
-    g_history_browse = -1;
-    size_t L = (g_saved_before_browse_len < sizeof(lineBuf) - 1) ? g_saved_before_browse_len : (sizeof(lineBuf) - 1);
-    memcpy(lineBuf, g_saved_before_browse, L);
-    g_line_len = L;
-    lineBuf[g_line_len] = 0;
-    g_cursor = g_line_len;
-    renderLine();
-  }
-}
-
-enum EscState {
-  ES_Normal,
-  ES_GotEsc,
-  ES_CSI,
-  ES_SS3,
-  ES_CSI_Param
-};
-static bool readLine() {
-  static EscState esc = ES_Normal;
-  static int csi_param = 0;
-  bool lineReady = false;
-  while (Serial.available()) {
-    int ic = Serial.read();
-    if (ic < 0) break;
-    char c = (char)ic;
-
-    if (esc == ES_Normal) {
-      if (c == '\r' || c == '\n') {
-        // Eat CRLF combo
-        if (c == '\r') {
-          if (Serial.available()) {
-            int p = Serial.peek();
-            if (p == '\n') Serial.read();
-          }
-        }
-        Serial.write('\r');
-        Serial.write('\n');
-        // Commit line
-        lineBuf[g_line_len] = 0;
-        // Push to history (non-empty)
-        if (g_line_len > 0) historyPush(lineBuf, g_line_len);
-        // Reset browsing state
-        g_history_browse = -1;
-        g_saved_before_browse[0] = 0;
-        g_saved_before_browse_len = 0;
-        // Reset render state
-        g_last_render_len = 0;
-        // Prepare next
-        g_cursor = 0;
-        g_line_len = 0;
-        lineReady = true;
-        break;
-      } else if ((c == 0x08) || (c == 0x7F)) {
-        // Backspace
-        if (g_cursor > 0) {
-          // shift left from cursor-1
-          for (size_t i = g_cursor - 1; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
-          g_line_len--;
-          g_cursor--;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        }
-        continue;
-      } else if (c == 0x1B) {
-        esc = ES_GotEsc;
-        csi_param = 0;
-        continue;
-      } else if (c == '\t') {
-        // Simple tab: insert 2 spaces
-        if (g_line_len + 2 < sizeof(lineBuf)) {
-          // shift right
-          for (size_t i = g_line_len + 1; i >= g_cursor + 2; --i) lineBuf[i] = lineBuf[i - 2];
-          lineBuf[g_cursor] = ' ';
-          lineBuf[g_cursor + 1] = ' ';
-          g_cursor += 2;
-          g_line_len += 2;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        } else {
-          Serial.write('\a');
-        }
-        continue;
-      } else if (c == 0x01) {
-        // Ctrl+A -> Home
-        g_cursor = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x05) {
-        // Ctrl+E -> End
-        g_cursor = g_line_len;
-        renderLine();
-        continue;
-      } else if (c == 0x0B) {
-        // Ctrl+K -> kill to end
-        g_line_len = g_cursor;
-        lineBuf[g_line_len] = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x15) {
-        // Ctrl+U -> clear line
-        g_cursor = 0;
-        g_line_len = 0;
-        lineBuf[0] = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x0C) {
-        // Ctrl+L -> redraw line (simple)
-        Serial.println();
-        renderLine();
-        continue;
-      } else if (c >= 32 && c <= 126) {
-        // Printable: insert at cursor
-        if (g_line_len + 1 < sizeof(lineBuf)) {
-          // shift right
-          for (size_t i = g_line_len; i > g_cursor; --i) lineBuf[i] = lineBuf[i - 1];
-          lineBuf[g_cursor] = c;
-          g_line_len++;
-          g_cursor++;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        } else {
-          Serial.write('\a');
-        }
-        continue;
-      } else {
-        // ignore others
-        continue;
-      }
-    } else if (esc == ES_GotEsc) {
-      if (c == '[') {
-        esc = ES_CSI;
-      } else if (c == 'O') {
-        esc = ES_SS3;  // function key like Home/End variants
-      } else {
-        esc = ES_Normal;
-      }
-    } else if (esc == ES_SS3) {
-      // Expect 'H' (Home) or 'F' (End)
-      if (c == 'H') {
-        g_cursor = 0;
-        renderLine();
-      } else if (c == 'F') {
-        g_cursor = g_line_len;
-        renderLine();
-      }
-      esc = ES_Normal;
-    } else if (esc == ES_CSI) {
-      if (c >= '0' && c <= '9') {
-        csi_param = (csi_param * 10) + (c - '0');
-        esc = ES_CSI_Param;
-      } else {
-        // single-char CSI
-        if (c == 'A') {
-          // Up
-          browseUp();
-        } else if (c == 'B') {
-          // Down
-          browseDown();
-        } else if (c == 'C') {
-          // Right
-          if (g_cursor < g_line_len) {
-            g_cursor++;
-            renderLine();
-          }
-        } else if (c == 'D') {
-          // Left
-          if (g_cursor > 0) {
-            g_cursor--;
-            renderLine();
-          }
-        } else if (c == 'H') {
-          g_cursor = 0;
-          renderLine();
-        } else if (c == 'F') {
-          g_cursor = g_line_len;
-          renderLine();
-        }
-        esc = ES_Normal;
-        csi_param = 0;
-      }
-    } else if (esc == ES_CSI_Param) {
-      if (c >= '0' && c <= '9') {
-        csi_param = (csi_param * 10) + (c - '0');
-      } else if (c == '~') {
-        // handle well-known: 3~ = Delete
-        if (csi_param == 3) {
-          // Delete at cursor
-          if (g_cursor < g_line_len) {
-            for (size_t i = g_cursor; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
-            g_line_len--;
-            lineBuf[g_line_len] = 0;
-            renderLine();
-          }
-        } else if (csi_param == 1 || csi_param == 7) {
-          // Home
-          g_cursor = 0;
-          renderLine();
-        } else if (csi_param == 4 || csi_param == 8) {
-          // End
-          g_cursor = g_line_len;
-          renderLine();
-        }
-        esc = ES_Normal;
-        csi_param = 0;
-      } else {
-        // Unexpected, reset
-        esc = ES_Normal;
-        csi_param = 0;
-      }
-    }
-  }
-  return lineReady;
-}
-
-// ================== Cross-filesystem copy (fscp) ==================
-static void fillFsIface(StorageBackend b, FSIface& out) {
-  if (b == StorageBackend::Flash) {
-    out.mount = [](bool autoFmt) {
-      return fsFlash.mount(autoFmt);
-    };
-    out.exists = [](const char* n) {
-      return fsFlash.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsFlash.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsFlash.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsFlash.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsFlash.getFileInfo(n, a, s, c);
-    };
-  } else if (b == StorageBackend::NAND) {
-    out.mount = [](bool autoFmt) {
-      return fsNAND.mount(autoFmt);
-    };
-    out.exists = [](const char* n) {
-      return fsNAND.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsNAND.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsNAND.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsNAND.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsNAND.getFileInfo(n, a, s, c);
-    };
-  } else {
-    out.mount = [](bool autoFmt) {
-      (void)autoFmt;
-      return fsPSRAM.mount(false);
-    };
-    out.exists = [](const char* n) {
-      return fsPSRAM.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsPSRAM.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsPSRAM.writeFile(n, d, s, m);
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsPSRAM.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsPSRAM.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsPSRAM.getFileInfo(n, a, s, c);
-    };
-  }
-}
-
-static bool parseBackendSpec(const char* spec, StorageBackend& outBackend, const char*& outPath) {
-  if (!spec) return false;
-  const char* colon = strchr(spec, ':');
-  if (!colon) return false;
-  size_t nameLen = (size_t)(colon - spec);
-  if (nameLen == 0) return false;
-  if (strncmp(spec, "flash", nameLen) == 0) outBackend = StorageBackend::Flash;
-  else if (strncmp(spec, "psram", nameLen) == 0) outBackend = StorageBackend::PSRAM_BACKEND;
-  else if (strncmp(spec, "nand", nameLen) == 0) outBackend = StorageBackend::NAND;
-  else return false;
-  outPath = colon + 1;  // may start with '/' or not
-  return true;
-}
-
-static bool normalizeFsPathCopy(char* dst, size_t dstCap, const char* input, bool wantTrailingSlash) {
-  if (!dst || !input) return false;
-  // Copy without leading '/'
-  const char* s = input;
-  while (*s == '/') ++s;
-  size_t L = strlen(s);
-  if (L >= dstCap) return false;
-  memcpy(dst, s, L + 1);
-  normalizePathInPlace(dst, wantTrailingSlash);
-  if (strlen(dst) > ActiveFS::MAX_NAME) return false;
-  return true;
-}
-
-static bool cmdFsCpImpl(const char* srcSpec, const char* dstSpec, bool force) {
-  StorageBackend sbSrc, sbDst;
-  const char* srcPathIn = nullptr;
-  const char* dstPathIn = nullptr;
-  if (!parseBackendSpec(srcSpec, sbSrc, srcPathIn) || !parseBackendSpec(dstSpec, sbDst, dstPathIn)) {
-    Console.println("fscp: invalid backend spec; use flash:/path psram:/path nand:/path");
-    return false;
-  }
-  // Prepare FS interfaces and mount (idempotent)
-  FSIface srcFS{}, dstFS{};
-  fillFsIface(sbSrc, srcFS);
-  fillFsIface(sbDst, dstFS);
-  // Mount: auto-format when empty on Flash/NAND; PSRAM no auto-format
-  bool srcMounted = srcFS.mount((sbSrc != StorageBackend::PSRAM_BACKEND));
-  bool dstMounted = dstFS.mount((sbDst != StorageBackend::PSRAM_BACKEND));
-  if (!srcMounted) {
-    Console.println("fscp: source mount failed");
-    return false;
-  }
-  if (!dstMounted) {
-    Console.println("fscp: destination mount failed");
-    return false;
-  }
-  // Normalize paths within 32-char limit
-  char srcAbs[ActiveFS::MAX_NAME + 1];
-  char dstArgRaw[ActiveFS::MAX_NAME + 1];
-  if (!normalizeFsPathCopy(srcAbs, sizeof(srcAbs), srcPathIn, /*wantTrailingSlash*/ false)) {
-    Console.println("fscp: source path too long (<=32)");
-    return false;
-  }
-  // Determine if destination is a folder spec (trailing '/')
-  size_t LdstIn = strlen(dstPathIn);
-  bool dstAsFolder = (LdstIn > 0 && dstPathIn[LdstIn - 1] == '/');
-  if (!normalizeFsPathCopy(dstArgRaw, sizeof(dstArgRaw), dstPathIn, dstAsFolder)) {
-    Console.println("fscp: destination path too long (<=32)");
-    return false;
-  }
-  // Source exists and info
-  if (!srcFS.exists(srcAbs)) {
-    Console.println("fscp: source not found");
-    return false;
-  }
-  uint32_t sAddr = 0, sSize = 0, sCap = 0;
-  if (!srcFS.getFileInfo(srcAbs, sAddr, sSize, sCap)) {
-    Console.println("fscp: getFileInfo(source) failed");
-    return false;
-  }
-  // Build destination absolute
-  char dstAbs[ActiveFS::MAX_NAME + 1];
-  if (dstAsFolder) {
-    const char* base = lastSlash(srcAbs);
-    if (!makePathSafe(dstAbs, sizeof(dstAbs), dstArgRaw, base)) {
-      Console.println("fscp: resulting destination path too long");
-      return false;
-    }
-  } else {
-    // already normalized as file
-    strncpy(dstAbs, dstArgRaw, sizeof(dstAbs));
-    dstAbs[sizeof(dstAbs) - 1] = 0;
-  }
-  if (pathTooLongForOnDisk(dstAbs)) {
-    Console.println("fscp: destination name too long for FS (would be truncated)");
-    return false;
-  }
-  // Overwrite policy
-  if (dstFS.exists(dstAbs) && !force) {
-    Console.println("fscp: destination exists (use -f to overwrite)");
-    return false;
-  }
-  // Read source fully (consistent with local cp)
-  uint8_t* buf = (uint8_t*)malloc(sSize ? sSize : 1);
-  if (!buf) {
-    Console.println("fscp: malloc failed");
-    return false;
-  }
-  uint32_t got = srcFS.readFile(srcAbs, buf, sSize);
-  if (got != sSize) {
-    Console.println("fscp: read failed");
-    free(buf);
-    return false;
-  }
-  // Reserve/erase alignment based on destination backend
-  uint32_t eraseAlign = getEraseAlignFor(sbDst);
-  uint32_t reserve = sCap;
-  if (reserve < eraseAlign) {
-    uint32_t a = (sSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
-    if (a > reserve) reserve = a;
-  }
-  if (reserve < eraseAlign) reserve = eraseAlign;
-
-  bool ok = false;
-  if (!dstFS.exists(dstAbs)) {
-    ok = dstFS.createFileSlot(dstAbs, reserve, buf, sSize);
-  } else {
-    uint32_t dA, dS, dC;
-    if (!dstFS.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
-    if (dC >= sSize) ok = dstFS.writeFileInPlace(dstAbs, buf, sSize, false);
-    if (!ok) ok = dstFS.writeFile(dstAbs, buf, sSize, fsReplaceModeFor(sbDst));
-  }
-  free(buf);
-  if (!ok) {
-    Console.println("fscp: write failed");
-    return false;
-  }
-  Console.println("fscp: ok");
-  return true;
-}
 
 // ========== Serial console / command handling ==========
 static int nextToken(char*& p, char*& tok) {
@@ -2066,14 +951,16 @@ static void printHelp() {
   Console.println("  wipebootloader               - erase chip then reboot to bootloader (DANGEROUS to FS)");
   Console.println("  meminfo                      - show heap/stack info");
   Console.println("  psramsmoketest               - safe, non-destructive PSRAM test");
-  Console.println("  bg [status|query]            - query background job status");
-  Console.println("  bg kill|cancel [force]       - cancel background job");
   Console.println("  reboot                       - reboot the MCU");
   Console.println("  timeout [ms]                 - show or set core1 timeout override (0=defaults)");
   Console.println("  puthex <file> <hex>          - upload binary as hex string");
   Console.println("  putb64 <file> <base64>       - upload binary as base64");
+  Console.println("  putb64s <file> [expected]    - paste base64; end with ESC[201~ (auto), Ctrl-D, or a line '.'");
+  Console.println("  hash <file> [sha256]         - print SHA-256 of file");
+  Console.println("  sha256 <file>                - alias for 'hash <file>'");
   Console.println("  cc <src> <dst>               - compile Tiny-C source file to binary");
   Console.println("  history                      - print recent command history");
+  Console.println("  termwidth [cols]             - show or set terminal width used by line editor");
   Console.println();
   Console.println("Editor (Nano-style) commands:");
   Console.println("  nano <file>                  - open Nano-like editor");
@@ -2115,6 +1002,21 @@ static void handleCommand(char* line) {
     int start = (g_history_count > HISTORY_MAX) ? (g_history_count - HISTORY_MAX) : 0;
     for (int i = start; i < g_history_count; ++i) {
       Console.printf("  %2d  %s\n", i - start + 1, g_history[i]);
+    }
+  } else if (!strcmp(t0, "termwidth")) {
+    char* cstr;
+    if (!nextToken(p, cstr)) {
+      Console.print("termwidth: ");
+      Console.print((unsigned)g_term_cols);
+      Console.println(" cols");
+    } else {
+      size_t cols = (size_t)strtoul(cstr, nullptr, 0);
+      if (cols < 20) cols = 20;
+      if (cols > 240) cols = 240;
+      g_term_cols = cols;
+      Console.print("termwidth set to ");
+      Console.print((unsigned)g_term_cols);
+      Console.println(" cols");
     }
   } else if (!strcmp(t0, "storage")) {
     char* tok;
@@ -2435,6 +1337,14 @@ static void handleCommand(char* line) {
     }
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
+  } else if (!strcmp(t0, "rescanfs")) {
+    size_t found = uniMem.rescan(50000UL);
+    Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
+    for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
+      const auto* di = uniMem.detectedInfo(i);
+      if (!di) continue;
+      Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
+    }
   } else if (!strcmp(t0, "timeout")) {
     char* msStr;
     if (!nextToken(p, msStr)) {
@@ -2563,6 +1473,40 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
+  } else if (!strcmp(t0, "putb64s")) {
+    char* fn;
+    char* opt;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: putb64s <file> [expected_decoded_size]");
+      return;
+    }
+    if (!checkNameLen(fn)) return;
+    uint32_t expected = 0;
+    if (nextToken(p, opt)) expected = (uint32_t)strtoul(opt, nullptr, 0);
+    if (g_b64u.active) {
+      Console.println("putb64s: another upload is active");
+      return;
+    }
+    b64uStart(fn, expected);
+    return;  // loop() will pump until upload completes
+  } else if (!strcmp(t0, "hash") || !strcmp(t0, "sha256")) {
+    char* fn;
+    char* algo = nullptr;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: hash <file> [sha256]");
+      return;
+    }
+    // optional algo token for 'hash'; ignored for 'sha256'
+    if (!strcmp(t0, "hash")) (void)nextToken(p, algo);
+    if (algo && strcmp(algo, "sha256") != 0) {
+      Console.println("hash: only sha256 is supported");
+      return;
+    }
+    uint8_t dig[32];
+    if (!sha256File(fn, dig)) return;
+    printHexLower(dig, sizeof(dig));
+    Serial.write(' ');
+    Serial.println(fn);
   } else if (!strcmp(t0, "cc")) {
     char* src;
     char* dst;
@@ -2849,8 +1793,8 @@ void setup() {
   Console.begin();
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
-  uniMem.setCsList({ PIN_FLASH_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS });
-  size_t found = uniMem.rescan();
+  uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
+  size_t found = uniMem.rescan(50000UL);
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
@@ -2884,6 +1828,12 @@ void loop1() {
 }
 void loop() {
   Exec.pollBackground();
+
+  if (g_b64u.active) {
+    b64uPump();  // non-blocking; returns when Serial queue is empty
+    return;      // keep pumping until completion; avoids mixing with the line editor
+  }
+
   if (readLine()) {
     handleCommand(lineBuf);
     Console.print("> ");

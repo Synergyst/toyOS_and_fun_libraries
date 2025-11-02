@@ -6,14 +6,25 @@
   - Core0: transport + protocol using a framed request/response over TX/RX pins.
   - Core1: blob executor (setup1/loop1 pattern).
   - Adds CoProcLang script pipeline (SCRIPT_BEGIN/DATA/END/EXEC) alongside binary blob pipeline.
-  Pins (as requested):
-    RX = GP0
-    TX = GP1
-  Notes:
-    - This replaces the previous SPI slave transport with a byte-stream serial link.
-    - Framing is the same as CoProcProto.h: 24B header + payload + CRC32(payload).
-    - The code scans the serial stream for MAGIC+VERSION and then reads a full frame.
-    - Baud rate is configurable (SOFT_BAUD). Default: 230400.
+
+  Added in this version:
+    - Simple SPI "passthrough" to the W25Q128FV flash for opcode 0x9F (Read JEDEC ID).
+      The RP2040 acts as a very lightweight SPI slave on GP12..GP15 to a master MCU:
+        SCK  = GP12  (input)
+        CS#  = GP13  (input)
+        MOSI = GP14  (input, from master)
+        MISO = GP15  (output, to master)
+      We bit-bang an SPI slave for Mode 0 at modest speeds and only implement the 0x9F opcode.
+      While the master clocks out the command byte, we drive MISO high (0xFF). Once the
+      command byte is recognized as 0x9F, we stream the cached JEDEC ID bytes back on MISO.
+      For all other opcodes we return 0xFF on MISO.
+
+    Notes:
+      - This is intentionally minimal and does not use PIO. It only handles 0x9F reliably.
+      - Master SPI mode assumed: CPOL=0, CPHA=0 (Mode 0).
+      - Use modest master SCK (e.g., <= 500 kHz) for reliable software-timed slave.
+      - We pre-read the JEDEC ID from the actual flash (pins 16..19) during setup and cache it.
+      - MISO is tri-stated (GPIO input) when CS# is high to avoid bus contention.
 */
 #include <Arduino.h>
 #include "BusArbiterWithISP.h"
@@ -23,6 +34,212 @@
 #include "CoProcProto.h"
 #include "CoProcLang.h"
 
+// ===== PIO defines (left as-is; not used by the passthrough) =====
+#include "hardware/pio.h"
+#include "hardware/pio_instructions.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+// Upstream (master) pins on GP12..GP15
+static const uint PIN_BRIDGE_SCK = 12;          // SCK from master (input)
+static const uint PIN_BRIDGE_CS = 13;           // CS# from master (input, active low)
+static const uint PIN_BRIDGE_MOSI_MASTER = 14;  // master MOSI (input to Pico)
+static const uint PIN_BRIDGE_MISO_MASTER = 15;  // Pico MISO (output to master)
+
+// SPI NOR flash pins (Pico as master)
+static const uint PIN_FLASH_CS = 16;    // CS#
+static const uint PIN_FLASH_SCK = 17;   // SCK
+static const uint PIN_FLASH_MOSI = 18;  // DI
+static const uint PIN_FLASH_MISO = 19;  // DO
+
+// ---- Software SPI (Mode 0) on GP16/17/18/19 for JEDEC probe ----
+static inline void softspi_pin_modes_for_probe() {
+  // SCK/CS under SIO control for bit-bang
+  pinMode(PIN_FLASH_CS, OUTPUT);
+  pinMode(PIN_FLASH_SCK, OUTPUT);
+  // Temporarily move MOSI to SIO so digitalWrite works (bridge assigned it to PIO0)
+  gpio_set_function(PIN_FLASH_MOSI, GPIO_FUNC_SIO);
+  pinMode(PIN_FLASH_MOSI, OUTPUT);
+  // MISO as input
+  pinMode(PIN_FLASH_MISO, INPUT);
+  digitalWrite(PIN_FLASH_CS, HIGH);  // idle
+  digitalWrite(PIN_FLASH_SCK, LOW);  // CPOL=0 idle low
+  digitalWrite(PIN_FLASH_MOSI, LOW);
+}
+static inline void softspi_release_after_probe() {
+  // Return ownership: MOSI back to PIO0 so the bridge can drive it (left from previous setup)
+  gpio_set_function(PIN_FLASH_MOSI, GPIO_FUNC_PIO0);
+  // SCK/CS driven again by PIO1 mirror (set to inputs here; SM re-enabling will set function)
+  pinMode(PIN_FLASH_CS, INPUT);
+  pinMode(PIN_FLASH_SCK, INPUT);
+  // MISO untouched (input)
+}
+static inline uint8_t softspi_txrx_byte(uint8_t tx, uint32_t half_us) {
+  uint8_t rx = 0;
+  for (int i = 7; i >= 0; --i) {
+    digitalWrite(PIN_FLASH_MOSI, (tx >> i) & 1);  // set up data
+    delayMicroseconds(half_us);
+    digitalWrite(PIN_FLASH_SCK, HIGH);  // rising edge: sample MISO
+    rx = (uint8_t)((rx << 1) | (uint8_t)digitalRead(PIN_FLASH_MISO));
+    delayMicroseconds(half_us);
+    digitalWrite(PIN_FLASH_SCK, LOW);  // falling edge
+  }
+  return rx;
+}
+static bool flash_read_jedec(uint8_t outId[3], uint32_t half_us = 5 /* ~100 kHz */) {
+  softspi_pin_modes_for_probe();
+  delayMicroseconds(5);  // settle
+  // Command 0x9F: Read JEDEC ID (3 bytes common)
+  digitalWrite(PIN_FLASH_CS, LOW);
+  delayMicroseconds(2);
+  (void)softspi_txrx_byte(0x9F, half_us);
+  outId[0] = softspi_txrx_byte(0x00, half_us);
+  outId[1] = softspi_txrx_byte(0x00, half_us);
+  outId[2] = softspi_txrx_byte(0x00, half_us);
+  delayMicroseconds(1);
+  digitalWrite(PIN_FLASH_CS, HIGH);
+  softspi_release_after_probe();
+  return true;
+}
+
+// ---------- Minimal SPI slave passthrough for 0x9F on GP12..GP15 ----------
+static volatile bool g_in_spi_session = false;
+static uint8_t g_jedec_id[3] = { 0xFF, 0xFF, 0xFF };  // cached from flash at setup
+
+// Drive MISO bit quickly
+static inline void bridgeMISOSet(int v) {
+  gpio_put(PIN_BRIDGE_MISO_MASTER, v ? 1 : 0);
+}
+
+// Returns immediately if CS# is deasserted quickly.
+static void handleSpiSlaveSession_0x9F_only() {
+  // Only handle while CS# is low
+  if (gpio_get(PIN_BRIDGE_CS)) return;
+
+  // Take control of MISO and idle it high; tri-state when CS# deasserts
+  pinMode(PIN_BRIDGE_MISO_MASTER, OUTPUT);
+  digitalWrite(PIN_BRIDGE_MISO_MASTER, HIGH);
+
+  auto cs_is_high = []() -> bool {
+    return gpio_get(PIN_BRIDGE_CS) != 0;
+  };
+  auto sck_is_high = []() -> bool {
+    return gpio_get(PIN_BRIDGE_SCK) != 0;
+  };
+  auto sck_is_low = []() -> bool {
+    return gpio_get(PIN_BRIDGE_SCK) == 0;
+  };
+  auto mosi_bit = []() -> int {
+    return (gpio_get(PIN_BRIDGE_MOSI_MASTER) & 1);
+  };
+
+  // Ensure we start aligned on a low SCK (Mode 0 idle low)
+  while (!cs_is_high() && !sck_is_low()) { /* wait SCK fall */
+  }
+  if (cs_is_high()) {
+    pinMode(PIN_BRIDGE_MISO_MASTER, INPUT);
+    return;
+  }
+
+  // 1) Receive the opcode (8 bits, sample on rising edge)
+  uint8_t opcode = 0;
+  for (int i = 0; i < 8; ++i) {
+    // Wait for rising edge
+    while (!cs_is_high() && sck_is_low()) { /* wait rise */
+    }
+    if (cs_is_high()) {
+      pinMode(PIN_BRIDGE_MISO_MASTER, INPUT);
+      return;
+    }
+
+    opcode = (uint8_t)((opcode << 1) | (uint8_t)mosi_bit());
+
+    // Wait for falling edge to complete the bit
+    while (!cs_is_high() && sck_is_high()) { /* wait fall */
+    }
+    if (cs_is_high()) {
+      pinMode(PIN_BRIDGE_MISO_MASTER, INPUT);
+      return;
+    }
+  }
+
+  const bool isJEDEC = (opcode == 0x9F);
+  int tx_bit = 7;
+  int jedec_idx = 0;
+  uint8_t tx_byte = isJEDEC ? g_jedec_id[0] : 0xFF;
+
+  // 2) Stream response bytes while CS# is low
+  while (!cs_is_high()) {
+    // Ensure SCK is low before presenting next bit (Mode 0)
+    while (!cs_is_high() && !sck_is_low()) { /* wait fall */
+    }
+    if (cs_is_high()) break;
+
+    // Present the bit before the rising edge
+    digitalWrite(PIN_BRIDGE_MISO_MASTER, (tx_byte >> tx_bit) & 1);
+
+    // Rising edge (master samples)
+    while (!cs_is_high() && sck_is_low()) { /* wait rise */
+    }
+    if (cs_is_high()) break;
+
+    // Falling edge completes the bit
+    while (!cs_is_high() && sck_is_high()) { /* wait fall */
+    }
+    if (cs_is_high()) break;
+
+    // Advance bit and possibly load the next byte
+    tx_bit--;
+    if (tx_bit < 0) {
+      tx_bit = 7;
+      if (isJEDEC) {
+        ++jedec_idx;
+        tx_byte = (jedec_idx < 3) ? g_jedec_id[jedec_idx] : 0xFF;
+      } else {
+        tx_byte = 0xFF;
+      }
+    }
+  }
+
+  // High-Z when not selected
+  pinMode(PIN_BRIDGE_MISO_MASTER, INPUT);
+}
+
+// Keep ISR minimal; it just runs the session and returns.
+static void onBridgeCSFalling() {
+  handleSpiSlaveSession_0x9F_only();
+}
+
+// ---- USB Serial console: "spi [N]" dumps last N bytes (default 64) + "flashid" + "bridge [0|1]" ----
+static void usbConsolePoll() {
+  static String line;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      line.trim();
+      if (line.length() > 0) {
+        if (line.startsWith("flashid")) {
+          uint8_t id[3] = { 0 };
+          bool ok = flash_read_jedec(id, 5 /* ~100 kHz */);
+          if (ok) {
+            Serial.printf("[FLASH] JEDEC: %02X %02X %02X\n", id[0], id[1], id[2]);
+          } else {
+            Serial.println("[FLASH] JEDEC read failed");
+          }
+        } else {
+          Serial.println("Commands:");
+          Serial.println("  flashid    - read JEDEC ID using Pico as temporary SPI master");
+        }
+      }
+      line = "";
+    } else {
+      if (line.length() < 80) line += c;
+    }
+  }
+}
+
+// ==================================================
 // ------- Debug toggle -------
 #ifndef COPROC_DEBUG
 #define COPROC_DEBUG 1
@@ -190,37 +407,15 @@ static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
       cmdName(hdr.cmd), (unsigned)hdr.cmd, (unsigned)hdr.seq, (unsigned)hdr.len);
 #endif
   switch (hdr.cmd) {
-    // Binary pipeline (delegated)
-    case CoProc::CMD_HELLO:
-      st = g_exec.cmdHELLO(g_isp_active, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_INFO:
-      st = g_exec.cmdINFO(g_isp_active, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_LOAD_BEGIN:
-      st = g_exec.cmdLOAD_BEGIN(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_LOAD_DATA:
-      st = g_exec.cmdLOAD_DATA(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_LOAD_END:
-      st = g_exec.cmdLOAD_END(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_EXEC:
-      st = g_exec.cmdEXEC(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-
-    // Housekeeping (delegated)
-    case CoProc::CMD_STATUS:
-      st = g_exec.cmdSTATUS(respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_MAILBOX_RD:
-      st = g_exec.cmdMAILBOX_RD(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_CANCEL:
-      st = g_exec.cmdCANCEL(respBuf, RESP_MAX, off);
-      break;
-
+    case CoProc::CMD_HELLO: st = g_exec.cmdHELLO(g_isp_active, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_INFO: st = g_exec.cmdINFO(g_isp_active, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_LOAD_BEGIN: st = g_exec.cmdLOAD_BEGIN(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_LOAD_DATA: st = g_exec.cmdLOAD_DATA(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_LOAD_END: st = g_exec.cmdLOAD_END(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_EXEC: st = g_exec.cmdEXEC(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_STATUS: st = g_exec.cmdSTATUS(respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_MAILBOX_RD: st = g_exec.cmdMAILBOX_RD(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_CANCEL: st = g_exec.cmdCANCEL(respBuf, RESP_MAX, off); break;
     case CoProc::CMD_RESET:
 #if COPROC_DEBUG
       DBG("[DBG] RESET\n");
@@ -229,34 +424,13 @@ static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
       watchdog_reboot(0, 0, 1500);
       st = CoProc::ST_OK;
       break;
-
-    // Script pipeline (delegated)
-    case CoProc::CMD_SCRIPT_BEGIN:
-      st = g_exec.cmdSCRIPT_BEGIN(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_SCRIPT_DATA:
-      st = g_exec.cmdSCRIPT_DATA(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_SCRIPT_END:
-      st = g_exec.cmdSCRIPT_END(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_SCRIPT_EXEC:
-      st = g_exec.cmdSCRIPT_EXEC(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-
-    // Named function dispatch (new)
-    case CoProc::CMD_FUNC:
-      st = g_exec.cmdFUNC(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-
-    // ISP control (kept local)
-    case CoProc::CMD_ISP_ENTER:
-      st = handleISP_ENTER(payload, hdr.len, respBuf, RESP_MAX, off);
-      break;
-    case CoProc::CMD_ISP_EXIT:
-      st = handleISP_EXIT(respBuf, RESP_MAX, off);
-      break;
-
+    case CoProc::CMD_SCRIPT_BEGIN: st = g_exec.cmdSCRIPT_BEGIN(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_SCRIPT_DATA: st = g_exec.cmdSCRIPT_DATA(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_SCRIPT_END: st = g_exec.cmdSCRIPT_END(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_SCRIPT_EXEC: st = g_exec.cmdSCRIPT_EXEC(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_FUNC: st = g_exec.cmdFUNC(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_ISP_ENTER: st = handleISP_ENTER(payload, hdr.len, respBuf, RESP_MAX, off); break;
+    case CoProc::CMD_ISP_EXIT: st = handleISP_EXIT(respBuf, RESP_MAX, off); break;
     default:
       st = CoProc::ST_BAD_CMD;
       CoProc::writePOD(respBuf, RESP_MAX, off, st);
@@ -275,7 +449,6 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
   const uint8_t magicBytes[4] = { (uint8_t)('C'), (uint8_t)('P'), (uint8_t)('R'), (uint8_t)('0') };
   uint8_t w[4] = { 0, 0, 0, 0 };
   uint32_t lastActivity = millis();
-
   for (;;) {
     uint8_t b;
     if (readByte(b, 50)) {
@@ -344,6 +517,7 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
       if ((millis() - lastActivity) > 1000) {
         lastActivity = millis();
       }
+      usbConsolePoll();
       serviceISPIfActive();
       tight_loop_contents();
       yield();
@@ -354,6 +528,7 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
 // ------- Core0: serial protocol loop -------
 static void protocolLoop() {
   for (;;) {
+    usbConsolePoll();
     serviceISPIfActive();
     if (!readFramedRequest(g_reqHdr, g_reqBuf)) {
       continue;
@@ -371,6 +546,7 @@ static void protocolLoop() {
       }
     }
     serviceISPIfActive();
+    usbConsolePoll();
     if (BOOTSEL) {
       Serial.println("Rebooting now..");
       delay(1500);
@@ -381,11 +557,11 @@ static void protocolLoop() {
   }
 }
 
-// ------- rp_selfupdate -------
+// ------- rp_selfupdate (unchanged; note: GP12 overlap with bridge) -------
 static const uint8_t PIN_MISO = 12;   // pin from RP to PSRAM pin-5
 static const uint8_t PIN_MOSI = 11;   // pin from RP to PSRAM pin-2
 static const uint8_t PIN_SCK = 10;    // pin from RP to PSRAM pin-6
-static const uint8_t PIN_DEC_EN = 9;  // 74HC138 G2A/G2B tied together via transistor or directly; active LOW
+static const uint8_t PIN_DEC_EN = 9;  // 74HC138 G2A/G2B tied together; active LOW
 static const uint8_t PIN_DEC_A0 = 8;  // 74HC138 address bit 0
 static const uint8_t PIN_DEC_A1 = 7;  // 74HC138 address bit 1
 static const uint8_t BANKS = 4;
@@ -407,42 +583,55 @@ static int32_t fn_add(const int32_t* a, uint32_t n) {
   for (uint32_t i = 0; i < n; ++i) sum += a[i];
   return (int32_t)sum;
 }
+static int32_t fn_tone(const int32_t* a, uint32_t n) {
+  if (n < 3) return CoProc::ST_PARAM;
+  int pin = (int)a[0], half = (int)a[1], cyc = (int)a[2];
+  if (pin < 0 || half <= 0 || cyc <= 0) return CoProc::ST_PARAM;
+  pinMode((uint8_t)pin, OUTPUT);
+  for (int i = 0; i < cyc; ++i) {
+    if (g_cancel_flag) break;
+    digitalWrite((uint8_t)pin, HIGH);
+    delayMicroseconds((uint32_t)half);
+    digitalWrite((uint8_t)pin, LOW);
+    delayMicroseconds((uint32_t)half);
+    tight_loop_contents();
+    yield();
+  }
+  return CoProc::ST_OK;
+}
 
 // ========== Setup and main ==========
 void setup() {
   Serial.begin();
   delay(5000);
   if (!Serial) delay(1000);
-
-  // Configure decoder selection for 4 banks via 74HC138
-  /*psram.configureDecoder138(BANKS, PIN_DEC_EN, PIN_DEC_A0, PIN_DEC_A1);
-  psram.begin();
-  // Mount and auto-format if empty (or call fs.format()/fs.wipeChip() explicitly)
-  fs.mount(true);
-  pinMode(PIN_UPDATE, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(PIN_UPDATE), onTrig, RISING);
-  Serial.println("Ready. Put update.bin into PSRAM FS, then pull GP22 HIGH to flash.");*/
-  // Example: to fully wipe PSRAM FS area for staging:
-  // rpupdfs_wipe_chip(fs);
-
   Serial.println("CoProc (soft-serial) booting...");
+
+  // Initialize pins for bridge (master-facing SPI slave)
+  pinMode(PIN_BRIDGE_SCK, INPUT);
+  pinMode(PIN_BRIDGE_CS, INPUT);
+  pinMode(PIN_BRIDGE_MOSI_MASTER, INPUT);
+  pinMode(PIN_BRIDGE_MISO_MASTER, INPUT);  // idle high-Z, we drive it only when CS# low
+
+  // Cache the JEDEC ID from the real flash (pins 16..19)
+  {
+    uint8_t id[3] = { 0 };
+    if (flash_read_jedec(id, 5 /* ~100 kHz */)) {
+      g_jedec_id[0] = id[0];
+      g_jedec_id[1] = id[1];
+      g_jedec_id[2] = id[2];
+      Serial.printf("[FLASH] Cached JEDEC: %02X %02X %02X\n", g_jedec_id[0], g_jedec_id[1], g_jedec_id[2]);
+    } else {
+      Serial.println("[FLASH] JEDEC read failed; caching FFs");
+      g_jedec_id[0] = g_jedec_id[1] = g_jedec_id[2] = 0xFF;
+    }
+  }
+
+  // CS# falling edge starts a slave session (only 0x9F supported)
+  attachInterrupt(digitalPinToInterrupt(PIN_BRIDGE_CS), onBridgeCSFalling, FALLING);
+
   ArbiterISP::initTestPins();
-  //bool ok = ArbiterISP::runTestSuiteOnce(true, true);
   ArbiterISP::cleanupToResetState();
-  /*if (!ok) {
-    Serial.println("P.O.S.T. failed!");
-    Serial.println("Entering ISP mode, please exit serial console and reprogram MCU!");
-    ArbiterISP::enterISPMode();
-    while (!BOOTSEL) ArbiterISP::serviceISPOnce();  // inside loop
-    delay(2000);
-    ArbiterISP::exitISPMode();
-    Serial.println("Exited ISP mode..");
-    Serial.println("Are we possibly testing the 74HC32 emulator..?");
-    bool ok2 = ArbiterISP::runHC32POST(true);  // verbose = true
-    Serial.println(ok2 ? F("[74HC32] DUT PASS") : F("[74HC32] DUT FAIL"));
-  } else {
-    Serial.println("P.O.S.T. success!");
-  }*/
 
   // Allocate protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);
@@ -454,12 +643,14 @@ void setup() {
 
   // initialize executor
   g_exec.begin();
-
   // Register named functions for CMD_FUNC
-  g_exec.registerFunc("ping", 0, fn_ping);  // expects no args
-  g_exec.registerFunc("add", -1, fn_add);   // accepts any arg count
+  g_exec.registerFunc("ping", 0, fn_ping);
+  g_exec.registerFunc("add", -1, fn_add);
+  g_exec.registerFunc("tone", 3, fn_tone);
 
   Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
+  Serial.println("SPI slave passthrough enabled on GP12..GP15 for opcode 0x9F (JEDEC ID).");
+  Serial.println("Assumes SPI Mode 0; please keep master SCK modest (<= ~500 kHz) for reliability.");
 }
 
 void loop() {
