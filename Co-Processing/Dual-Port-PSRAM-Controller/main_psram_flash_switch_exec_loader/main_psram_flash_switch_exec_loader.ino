@@ -1795,12 +1795,21 @@ void setup() {
   Console.println("System booting..");
   Console.begin();
 
-  // Arbiter wiring hint (Host A):
+  // Arbiter + CBTLV3257 wiring help (this MCU = Owner A)
   Console.println("External SPI arbiter wiring (this MCU = Owner A):");
-  Console.println("  REQ_A:   RP2040 GP4  -> ATtiny861A PA0 (active-low)");
-  Console.println("  GRANT_A: RP2040 GP5  <- ATtiny861A PA4 (OWNER_A, active-high)");
-  Console.println("  Notes:   - OE(PB4) and SEL(PB3) are driven by the ATtiny to the CBTLV3257");
-  Console.println("           - Optional IRQ_A on ATtiny PB5 (not required by this firmware)");
+  Console.println("  REQ_A:   RP2040 GP4  -> ATtiny861A PA0 (active-low request)");
+  Console.println("  GRANT_A: RP2040 GP5  <- ATtiny861A PA4 (OWNER_A, high = granted)");
+  Console.println("CBTLV3257 control (driven by ATtiny861A):");
+  Console.println("  S (select):    <- PB3  (B side selected when HIGH; A side when LOW)");
+  Console.println("  OE# (enable):  <- PB4  (active LOW; bus connected when LOW)");
+  Console.println("CBTLV3257 channel map (A = this MCU, B = co-processor, Y = shared to memories):");
+  Console.println("  CH0 (SCK):   A<- GP10 (SCK_A),   B<- <co-proc SCK>,   Y-> SCK to PSRAM/NOR/NAND");
+  Console.println("  CH1 (MOSI):  A<- GP11 (MOSI_A),  B<- <co-proc MOSI>,  Y-> MOSI/DI to PSRAM/NOR/NAND");
+  Console.println("  CH2 (MISO):  A-> GP12 (MISO_A),  B-> <co-proc MISO>,  Y<- MISO/DO from PSRAM/NOR/NAND");
+  Console.println("  CH3 (opt):   Use for CS-bank enable or HOLD#/WP# if desired; else leave NC");
+  Console.println("Notes:");
+  Console.println("  - Device CS lines can remain direct from both MCUs; non-owner CS toggles are benign");
+  Console.println("    because only the owner’s SCK/MOSI/MISO are connected through the CBTLV3257.");
   Console.println();
 
   // Enable arbiter guard (Host A)
