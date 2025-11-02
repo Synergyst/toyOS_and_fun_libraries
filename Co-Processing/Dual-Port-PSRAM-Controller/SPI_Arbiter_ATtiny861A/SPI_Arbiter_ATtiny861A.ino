@@ -6,7 +6,7 @@
 #include <Arduino.h>
 #include <avr/wdt.h>
 
-// ===== Pin map (edit if needed) =====
+// ===== Pin map =====
 #define REQ_A_BIT PA0
 #define REQ_B_BIT PA1
 #define BUS0_BIT PA2

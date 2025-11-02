@@ -6,56 +6,78 @@
 #define ARB_VERBOSE 0  // Only affects POST; ISP is never verbose
 #endif
 
+// ===== Pin map (this is copied from the SPI_Arbiter_ATTiny861A.ino for refernce use only, do not uncomment!) =====
+/*
+// ATtiny861A Arbiter v1.3 (PA/PB direct, avoids PB0/PB1/PB2/PB7)
+// 8 MHz internal, BOD ≈ 3.0 V. Program via PB0/PB1/PB2, RESET=PB7.
+// Inputs:  REQ_A=PA0, REQ_B=PA1, BUS0=PA2 (BUS1 optional)
+// Outputs: SEL=PB3, OE=PB4, OWNER_A=PA4, OWNER_B=PA5, PREV_A=PA6, PREV_B=PA7, IRQ_A=PB5, IRQ_B=PB6
+#define REQ_A_BIT PA0
+#define REQ_B_BIT PA1
+#define BUS0_BIT PA2
+#define USE_BUS1 0
+#define BUS1_BIT PA3
+
+#define SEL_BIT PB3
+#define OE_BIT PB4
+#define OWNER_A_BIT PA4
+#define OWNER_B_BIT PA5
+#define PREV_A_BIT PA6
+#define PREV_B_BIT PA7
+#define IRQ_A_BIT PB5
+#define IRQ_B_BIT PB6
+*/
+
 // Arbiter tester pin map (Pico ↔ ATtiny861A)
 #ifndef ARB_PIN_REQ_A_OUT
-#define ARB_PIN_REQ_A_OUT 16
+#define ARB_PIN_REQ_A_OUT 16  // wire to PA0 .
 #endif
 #ifndef ARB_PIN_REQ_B_OUT
-#define ARB_PIN_REQ_B_OUT 17
+#define ARB_PIN_REQ_B_OUT 17  // wire to PA1 .
 #endif
 #ifndef ARB_PIN_OWNER_A_IN
-#define ARB_PIN_OWNER_A_IN 18
+#define ARB_PIN_OWNER_A_IN 18  // wire to PA4 .
 #endif
 #ifndef ARB_PIN_OWNER_B_IN
-#define ARB_PIN_OWNER_B_IN 19
+#define ARB_PIN_OWNER_B_IN 19  // wire to PA5 .
 #endif
 #ifndef ARB_PIN_PREV_A_IN
-#define ARB_PIN_PREV_A_IN 20
+#define ARB_PIN_PREV_A_IN 20  // wire to PA6 .
 #endif
 #ifndef ARB_PIN_PREV_B_IN
-#define ARB_PIN_PREV_B_IN 21
+#define ARB_PIN_PREV_B_IN 21  // wire to PA7 .
 #endif
 #ifndef ARB_PIN_IRQ_A_IN
-#define ARB_PIN_IRQ_A_IN 6
+#define ARB_PIN_IRQ_A_IN 6  // wire to PB5 .
 #endif
 #ifndef ARB_PIN_IRQ_B_IN
-#define ARB_PIN_IRQ_B_IN 7
+#define ARB_PIN_IRQ_B_IN 7  // wire to PB6 .
 #endif
 #ifndef ARB_PIN_SEL_IN
-#define ARB_PIN_SEL_IN 8
+#define ARB_PIN_SEL_IN 8  // wire to PB3 .
 #endif
 #ifndef ARB_PIN_OE_IN
-#define ARB_PIN_OE_IN 9
+#define ARB_PIN_OE_IN 9  // wire to PB4 .
 #endif
 #ifndef ARB_PIN_BUS_ACTIVE
-#define ARB_PIN_BUS_ACTIVE 22
+#define ARB_PIN_BUS_ACTIVE 22  // wire to PA2 (??? I think?? TODO: verify this is correct in the ATTiny861BusArbiter INO sketch...)
 #endif
 #ifndef ARB_PIN_TINY_RST
-#define ARB_PIN_TINY_RST 12
+#define ARB_PIN_TINY_RST 12  // wire to PB7 .
 #endif
 
 // ArduinoISP (bit-banged) pins
 #ifndef ARB_ISP_RESET
-#define ARB_ISP_RESET ARB_PIN_TINY_RST
+#define ARB_ISP_RESET ARB_PIN_TINY_RST  // already wired above, remove periods and go through checklist if you are wiring on an empty breadboard
 #endif
 #ifndef ARB_ISP_MOSI
-#define ARB_ISP_MOSI 15
+#define ARB_ISP_MOSI 15  // wire to P
 #endif
 #ifndef ARB_ISP_MISO
-#define ARB_ISP_MISO 14
+#define ARB_ISP_MISO 14  // wire to P
 #endif
 #ifndef ARB_ISP_SCK
-#define ARB_ISP_SCK 13
+#define ARB_ISP_SCK 13  // wire to P
 #endif
 #ifndef ARB_ISP_SPI_CLOCK_HZ
 #define ARB_ISP_SPI_CLOCK_HZ (1000000 / 6)  // ~166 kHz

@@ -3,9 +3,9 @@
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 8100000UL  // 50 kHz is known-good-max, anymore and you're pushing it.
-#define W25Q_SPI_CLOCK_HZ 8100000UL     // NOR ID speed
-#define MX35_SPI_CLOCK_HZ 8100000UL     // NAND ID speed
+#define UNIFIED_SPI_CLOCK_HZ 1000000UL  // 1 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 1000000UL     // 1 MHz NOR
+#define MX35_SPI_CLOCK_HZ 1000000UL     // 1 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
@@ -1785,44 +1785,65 @@ static void handleCommand(char* line) {
   }
 }
 
-#include "BusArbiterClient.h"
-
 // ========== Setup and main loops ==========
 void setup() {
+  delay(500);
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
+
   Console.println("System booting..");
   Console.begin();
+
+  // Arbiter wiring hint (Host A):
+  Console.println("External SPI arbiter wiring (this MCU = Owner A):");
+  Console.println("  REQ_A:   RP2040 GP4  -> ATtiny861A PA0 (active-low)");
+  Console.println("  GRANT_A: RP2040 GP5  <- ATtiny861A PA4 (OWNER_A, active-high)");
+  Console.println("  Notes:   - OE(PB4) and SEL(PB3) are driven by the ATtiny to the CBTLV3257");
+  Console.println("           - Optional IRQ_A on ATtiny PB5 (not required by this firmware)");
+  Console.println();
+
+  // Enable arbiter guard (Host A)
+  UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5,
+                                        /*reqActiveLow*/ true, /*grantActiveHigh*/ true,
+                                        /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
+
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
+
+  // Keep slow scan for robustness
   size_t found = uniMem.rescan(50000UL);
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
     if (!di) continue;
-    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n",
+                   di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName,
+                   (unsigned long long)di->capacityBytes);
   }
+
   bool nandOk = fsNAND.begin(uniMem);
   bool flashOk = fsFlash.begin(uniMem);
   bool psramOk = fsPSRAM.begin(uniMem);
   if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+
   bindActiveFs(g_storage);
   bool mounted = activeFs.mount(g_storage == StorageBackend::PSRAM_BACKEND /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
+
   for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
+
   Exec.attachConsole(&Console);
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   updateExecFsTable();
-  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
 
-  BusArbiterClient::begin(/*REQ pin*/ 4, /*GRANT pin*/ 5, /*REQ active low*/ true, /*GRANT active high*/ true);
-
+  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
+                 (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
@@ -1834,12 +1855,10 @@ void loop1() {
 }
 void loop() {
   Exec.pollBackground();
-
   if (g_b64u.active) {
-    b64uPump();  // non-blocking; returns when Serial queue is empty
-    return;      // keep pumping until completion; avoids mixing with the line editor
+    b64uPump();
+    return;
   }
-
   if (readLine()) {
     handleCommand(lineBuf);
     Console.print("> ");

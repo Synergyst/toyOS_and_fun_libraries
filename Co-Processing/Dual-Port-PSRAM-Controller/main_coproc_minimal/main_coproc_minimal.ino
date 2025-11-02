@@ -1,33 +1,21 @@
 /*
   main_coproc_softserial.ino
   RP2350 / RP2040 Co-Processor (software-serial "bitbanged UART") — transport + blob executor + script interpreter
-
-  SPI NOR emulation + proxy (never direct pass-through):
-    - SPI slave emulation on GP12..GP15 (Mode 0). Master never clocks the real flash.
-    - We translate selected commands to the actual NOR on GP16..GP19.
-    - Read proxy: serves data from a small 4K-sector cache. On cache miss, returns 0xFF
-      for this session and schedules a background fill (so subsequent reads hit).
-    - Write proxy: captures 0x02 data during CS-low and, when CS goes high and WEL=1,
-      commits to the real flash in the background. 0x20 erases are also committed in background.
-    - Emulated SR1 (WIP/WEL) follows realistic behavior: WEL set by 0x06, cleared when commit starts;
-      WIP set while background commit runs.
-    - Non-blocking opcode logging: the SPI handler never prints; it pushes to a ring buffer.
-      Use 'oplog' console commands to drain/view logs. Auto-drain in loop1.
-
-  New console commands:
-    - writehex <addr_hex> <b1> [b2 ...]   program up to 256 bytes (page boundary split by helper)
-    - erase4k <addr_hex>                  4K sector erase
-    - prefetch <addr_hex> [count]         schedule 4K sector cache fill(s)
-    - flashid, dump, sr1, setwel, setbusy, setjedec, oplog, opstats (as before)
 */
 #include <Arduino.h>
+// ------- Shared HW SPI (FLASH + PSRAM) -------
+#include "ConsolePrint.h"
+// Force low identification speed compatible with the bridge
+#define UNIFIED_SPI_INSTANCE SPI1
+#define UNIFIED_SPI_CLOCK_HZ 1000000UL  // 1 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 1000000UL     // 1 MHz NOR
+#define MX35_SPI_CLOCK_HZ 1000000UL     // 1 MHz NAND
+#include "UnifiedSPIMemSimpleFS.h"
 #include "BusArbiterWithISP.h"
-#include "PSRAMMulti.h"
 #include "rp_selfupdate.h"
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
 #include "CoProcLang.h"
-#include "BusArbiterClient.h"
 
 static inline void compiler_barrier() {
   __asm__ __volatile__("" ::
@@ -57,12 +45,23 @@ static const uint8_t PIN_TX = 1;  // GP1  (co-processor TX)
 #endif
 static SoftwareSerial link(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
 
+// ------- Console wrapper -------
+static ConsolePrint Console;
+
 // ------- Mailbox / cancel (shared with blob + script) -------
 #ifndef BLOB_MAILBOX_MAX
 #define BLOB_MAILBOX_MAX 256
 #endif
 extern "C" __attribute__((aligned(4))) uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
 volatile uint8_t g_cancel_flag = 0;
+
+// ------- Flash/PSRAM instances -------
+const uint8_t PIN_PSRAM_MISO = 12;  // GP12
+const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
+const uint8_t PIN_PSRAM_SCK = 10;   // GP10
+const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
+UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
+PSRAMUnifiedSimpleFS fsPSRAM;
 
 // ------- ISP mode state -------
 static volatile bool g_isp_active = false;
@@ -123,7 +122,7 @@ static bool writeAll(const uint8_t* src, size_t n, uint32_t timeoutMs) {
   return true;
 }
 
-// ------- ISP handlers (unchanged) -------
+// ------- ISP handlers -------
 static int32_t handleISP_ENTER(const uint8_t* in, size_t len, uint8_t* out, size_t cap, size_t& off) {
   (void)in;
   (void)len;
@@ -347,18 +346,7 @@ static void protocolLoop() {
   }
 }
 
-// ------- rp_selfupdate (unchanged; note: GP12 overlap with bridge) -------
-static const uint8_t PIN_MISO = 12;   // pin from RP to PSRAM pin-5
-static const uint8_t PIN_MOSI = 11;   // pin from RP to PSRAM pin-2
-static const uint8_t PIN_SCK = 10;    // pin from RP to PSRAM pin-6
-static const uint8_t PIN_DEC_EN = 9;  // 74HC138 G2A/G2B tied together; active LOW
-static const uint8_t PIN_DEC_A0 = 8;  // 74HC138 address bit 0
-static const uint8_t PIN_DEC_A1 = 7;  // 74HC138 address bit 1
-static const uint8_t BANKS = 4;
-static const uint32_t PER_CHIP_BYTES = 8u * 1024u * 1024u;
-PSRAMAggregateDevice psram(PIN_MISO, PIN_MOSI, PIN_SCK, PER_CHIP_BYTES);
-PSRAMSimpleFS_Multi fs(psram, /*capacityBytes=*/PER_CHIP_BYTES* BANKS);
-
+// ------- rp_selfupdate -------
 const uint8_t PIN_UPDATE = 22;
 volatile bool doUpdate = false;
 void onTrig() {
@@ -393,42 +381,69 @@ static int32_t fn_tone(const int32_t* a, uint32_t n) {
 
 // ========== Setup and main ==========
 void setup() {
+  delay(500);
   Serial.begin();
   delay(5000);
   if (!Serial) delay(1000);
   Serial.println("CoProc (soft-serial) booting...");
 
+  // Arbiter wiring hint (Co-Processor B):
+  Serial.println("External SPI arbiter wiring (this MCU = Owner B):");
+  Serial.println("  REQ_B:   RP2040 GP4  -> ATtiny861A PA1 (active-low)");
+  Serial.println("  GRANT_B: RP2040 GP5  <- ATtiny861A PA5 (OWNER_B, active-high)");
+  Serial.println("  Notes:   - OE(PB4) and SEL(PB3) are driven by the ATtiny to the CBTLV3257");
+  Serial.println("           - Optional IRQ_B on ATtiny PB6 (not required by this firmware)");
+  Serial.println();
+
   ArbiterISP::initTestPins();
   ArbiterISP::cleanupToResetState();
 
-  // Allocate protocol buffers
+  // Protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);
   g_respBuf = (uint8_t*)malloc(RESP_MAX);
 
-  // Initialize software serial link
+  // Software serial link
   link.begin(SOFT_BAUD);
-  link.listen();  // ensure active receiver
+  link.listen();
 
-  // Initialize executor
+  // Executor
   g_exec.begin();
-  // Register named functions for CMD_FUNC
   g_exec.registerFunc("ping", 0, fn_ping);
   g_exec.registerFunc("add", -1, fn_add);
   g_exec.registerFunc("tone", 3, fn_tone);
 
-  BusArbiterClient::begin(/*REQ pin*/ 4, /*GRANT pin*/ 5, /*REQ active low*/ true, /*GRANT active high*/ true);
+  // Enable arbiter guard (Co-Proc B)
+  UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5,
+                                        /*reqActiveLow*/ true, /*grantActiveHigh*/ true,
+                                        /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
 
-  Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
+  uniMem.begin();
+  uniMem.setPreservePsramContents(true);
+  uniMem.setCsList({ PIN_PSRAM_CS0 });
+
+  // Keep slow scan for robustness
+  size_t found = uniMem.rescan(50000UL);
+  Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
+  for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
+    const auto* di = uniMem.detectedInfo(i);
+    if (!di) continue;
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n",
+                   di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName,
+                   (unsigned long long)di->capacityBytes);
+  }
+
+  bool psramOk = fsPSRAM.begin(uniMem);
+  if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+
+  Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n",
+                (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
 }
-
 void loop() {
-  protocolLoop();  // never returns
-}
-
+  protocolLoop();
+}  // never returns
 // setup1/loop1 for core1 (Philhower)
 void setup1() { /* nothing */
 }
-
 void loop1() {
   g_exec.workerPoll();
   tight_loop_contents();
