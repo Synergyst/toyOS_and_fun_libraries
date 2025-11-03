@@ -1,15 +1,15 @@
 /*
   main_coproc_softserial.ino
-  RP2350 / RP2040 Co-Processor (software-serial "bitbanged UART") — transport + blob executor + script interpreter
+  RP2350 / RP2040 Co-Processor (software-serial "bitbanged UART") - transport + blob executor + script interpreter
 */
 #include <Arduino.h>
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 1000000UL  // 1 MHz SPI
-#define W25Q_SPI_CLOCK_HZ 1000000UL     // 1 MHz NOR
-#define MX35_SPI_CLOCK_HZ 1000000UL     // 1 MHz NAND
+#define UNIFIED_SPI_CLOCK_HZ 10000UL  // 1 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 10000UL     // 1 MHz NOR
+#define MX35_SPI_CLOCK_HZ 10000UL     // 1 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
 #include "BusArbiterWithISP.h"
 #include "rp_selfupdate.h"
@@ -56,10 +56,15 @@ extern "C" __attribute__((aligned(4))) uint8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = 
 volatile uint8_t g_cancel_flag = 0;
 
 // ------- Flash/PSRAM instances -------
-const uint8_t PIN_PSRAM_MISO = 12;  // GP12
-const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
-const uint8_t PIN_PSRAM_SCK = 10;   // GP10
-const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
+const uint8_t PIN_PSRAM_MISO = 12;            // GP12
+const uint8_t PIN_PSRAM_MOSI = 15;            // GP15
+const uint8_t PIN_PSRAM_SCK = 14;             // GP14
+const uint8_t PIN_NOR_MISO = PIN_PSRAM_MISO;  // PIN_PSRAM_MISO
+const uint8_t PIN_NOR_MOSI = PIN_PSRAM_MOSI;  // PIN_PSRAM_MOSI
+const uint8_t PIN_NOR_SCK = PIN_PSRAM_SCK;    // PIN_PSRAM_SCK
+const uint8_t PIN_PSRAM_CS0 = 13;             // GP13
+const uint8_t PIN_NOR_CS0 = 13;               // GP
+//const uint8_t PIN_NAND_CS0 = 13;              // GP
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
 PSRAMUnifiedSimpleFS fsPSRAM;
 
@@ -379,30 +384,76 @@ static int32_t fn_tone(const int32_t* a, uint32_t n) {
   return CoProc::ST_OK;
 }
 
+#include "MCP_DAC.h"
+//MCP4921 MCP(19, 18);  //  SW SPI
+MCP4921 MCP;  //  HW SPI
+
+volatile int x;
+uint32_t start, stop;
+
+void performance_test() {
+  Console.println();
+  Console.println(__FUNCTION__);
+
+  start = micros();
+  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
+    x = MCP.write(value, 0);
+  }
+  stop = micros();
+  Console.print(MCP.maxValue());
+  Console.print(" x MCP.write():\t");
+  Console.print(stop - start);
+  Console.print("\t");
+  Console.println((stop - start) / (MCP.maxValue() + 1.0));
+  delay(10);
+
+  start = micros();
+  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
+    MCP.fastWriteA(value);
+  }
+  stop = micros();
+  Console.print(MCP.maxValue());
+  Console.print(" x MCP.fastWriteA():\t");
+  Console.print(stop - start);
+  Console.print("\t");
+  Console.println((stop - start) / (MCP.maxValue() + 1.0));
+  delay(10);
+}
+
 // ========== Setup and main ==========
 void setup() {
   delay(500);
   Serial.begin();
-  delay(5000);
   if (!Serial) delay(1000);
+  delay(5000);
   Serial.println("CoProc (soft-serial) booting...");
 
   // Arbiter + CBTLV3257 wiring help (this MCU = Owner B)
-  Serial.println("External SPI arbiter wiring (this MCU = Owner B):");
-  Serial.println("  REQ_B:   RP2040 GP4  -> ATtiny861A PA1 (active-low request)");
-  Serial.println("  GRANT_B: RP2040 GP5  <- ATtiny861A PA5 (OWNER_B, high = granted)");
+  /*Serial.println("External SPI arbiter wiring (this MCU = Owner B):");
+  Serial.println("  REQ_B:");
+  Serial.println("    RP2040 GP4                    --->    ATtiny861A PA1 (active-low request)");
+  Serial.println("  GRANT_B:");
+  Serial.println("    RP2040 GP5                    <---    ATtiny861A PA5 (OWNER_B, high = granted)");
+  Serial.println("CBTLV3257 channel map:");
+  Serial.println("  CH0 (SCK):");
+  Serial.println("    Master A                      --->    pin 2  (1B1)");
+  Serial.println("    Master B                      --->    pin 3  (1B2)");
+  Serial.println("    SCK to PSRAM/NOR/NAND         --->    pin 4  (1A)");
+  Serial.println("  CH1 (MOSI):");
+  Serial.println("    Master A                      --->    pin 5  (2B1)");
+  Serial.println("    Master B                      --->    pin 6  (2B2)");
+  Serial.println("    MOSI/DI to PSRAM/NOR/NAND     --->    pin 7  (2A)");
+  Serial.println("  CH2 (MISO):");
+  Serial.println("    Master A                      --->    pin 11 (3B1)");
+  Serial.println("    Master B                      --->    pin 10 (3B2)");
+  Serial.println("    MISO/DO from PSRAM/NOR/NAND   --->    pin 9  (3A)");
+  Serial.println("  CH3 (opt):\n    Use for CS-bank enable or HOLD#/WP# if desired; else leave NC");
   Serial.println("CBTLV3257 control (driven by ATtiny861A):");
-  Serial.println("  S (select):    <- PB3  (B side selected when HIGH; A side when LOW)");
-  Serial.println("  OE# (enable):  <- PB4  (active LOW; bus connected when LOW)");
-  Serial.println("CBTLV3257 channel map (A = host MCU, B = this MCU, Y = shared to memories):");
-  Serial.println("  CH0 (SCK):   A<- <host SCK>,     B<- GP10 (SCK_B),   Y-> SCK to PSRAM/NOR/NAND");
-  Serial.println("  CH1 (MOSI):  A<- <host MOSI>,    B<- GP11 (MOSI_B),  Y-> MOSI/DI to PSRAM/NOR/NAND");
-  Serial.println("  CH2 (MISO):  A-> <host MISO>,    B-> GP12 (MISO_B),  Y<- MISO/DO from PSRAM/NOR/NAND");
-  Serial.println("  CH3 (opt):   Use for CS-bank enable or HOLD#/WP# if desired; else leave NC");
+  Serial.println("  S (select, pin 1):\n    PB3  (selects between B1 and B2; B side selected when HIGH)");
+  Serial.println("  OE# (enable, pin 15):\n    PB4  (active LOW; bus connected when LOW)");
   Serial.println("Notes:");
-  Serial.println("  - Device CS lines can remain direct from both MCUs; non-owner CS toggles are benign");
-  Serial.println("    because only the owner’s SCK/MOSI/MISO are connected through the CBTLV3257.");
-  Serial.println();
+  Serial.println("  - Device CS lines may remain direct from each MCU.");
+  Serial.println();*/
 
   ArbiterISP::initTestPins();
   ArbiterISP::cleanupToResetState();
@@ -422,9 +473,7 @@ void setup() {
   g_exec.registerFunc("tone", 3, fn_tone);
 
   // Enable arbiter guard (Co-Proc B)
-  UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5,
-                                        /*reqActiveLow*/ true, /*grantActiveHigh*/ true,
-                                        /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
+  //UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5, /*reqActiveLow*/ true, /*grantActiveHigh*/ true, /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
 
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
@@ -436,16 +485,24 @@ void setup() {
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
     if (!di) continue;
-    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n",
-                   di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName,
-                   (unsigned long long)di->capacityBytes);
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
 
   bool psramOk = fsPSRAM.begin(uniMem);
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
 
-  Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n",
-                (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
+  SPI.begin();
+  MCP.begin(17);
+  Console.print("DAC CHANNELS:\t");
+  Console.println(MCP.channels());
+  Console.print("DAC MAXVALUE:\t");
+  Console.println(MCP.maxValue());
+
+  performance_test();
+  //analogWrite_test();
+  //MCP.write(analogRead(A0), 0);
+
+  Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
 }
 void loop() {
   protocolLoop();

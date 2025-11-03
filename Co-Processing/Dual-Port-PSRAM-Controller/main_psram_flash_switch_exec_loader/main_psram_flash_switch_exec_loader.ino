@@ -45,6 +45,8 @@ static ConsolePrint Console;  // Console wrapper
 #define FILE_PWMC2350 "pwmc2350"
 #include "blob_retmin.h"
 #define FILE_RETMIN "retmin"
+#include "blob_dont.h"
+#define FILE_DONT "dont"
 #include "scripts.h"
 #define FILE_BLINKSCRIPT "blinkscript"
 #define FILE_ONSCRIPT "onscript"
@@ -54,20 +56,20 @@ static ConsolePrint Console;  // Console wrapper
 #define FILE_PT3 "pt3"
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
-// Pins you already have:
-const uint8_t PIN_FLASH_MISO = 12;  // GP12
-const uint8_t PIN_PSRAM_MISO = 12;  // GP12
-const uint8_t PIN_FLASH_MOSI = 11;  // GP11
-const uint8_t PIN_PSRAM_MOSI = 11;  // GP11
-const uint8_t PIN_FLASH_SCK = 10;   // GP10
-const uint8_t PIN_PSRAM_SCK = 10;   // GP10
-const uint8_t PIN_FLASH_CS0 = 9;    // GP9
-const uint8_t PIN_PSRAM_CS0 = 14;   // GP14
-const uint8_t PIN_PSRAM_CS1 = 15;   // GP15
-const uint8_t PIN_PSRAM_CS2 = 26;   // GP26
-const uint8_t PIN_PSRAM_CS3 = 27;   // GP27
-const uint8_t PIN_NAND_CS = 28;     // GP28
-const uint8_t PIN_FLASH_CS1 = 29;   // GP29
+// ========== Pins for Memory Chips ==========
+const uint8_t PIN_FLASH_MISO = 4;               // GP4
+const uint8_t PIN_PSRAM_MISO = PIN_FLASH_MISO;  // GP4
+const uint8_t PIN_FLASH_MOSI = 3;               // GP3
+const uint8_t PIN_PSRAM_MOSI = PIN_FLASH_MISO;  // GP3
+const uint8_t PIN_FLASH_SCK = 6;                // GP6
+const uint8_t PIN_PSRAM_SCK = PIN_FLASH_SCK;    // GP6
+const uint8_t PIN_FLASH_CS0 = 8;                // GP8
+const uint8_t PIN_PSRAM_CS0 = 14;               // GP14
+const uint8_t PIN_PSRAM_CS1 = 15;               // GP15
+const uint8_t PIN_PSRAM_CS2 = 26;               // GP26
+const uint8_t PIN_PSRAM_CS3 = 27;               // GP27
+const uint8_t PIN_NAND_CS = 5;                  // GP5
+const uint8_t PIN_FLASH_CS1 = 29;               // GP29
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
@@ -76,7 +78,7 @@ enum class StorageBackend {
   PSRAM_BACKEND,
   NAND,
 };
-static StorageBackend g_storage = StorageBackend::PSRAM_BACKEND;
+static StorageBackend g_storage = StorageBackend::NAND;
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
@@ -868,6 +870,7 @@ static const BlobReg g_blobs[] = {
   { FILE_PWMC, blob_pwmc, blob_pwmc_len },
   { FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len },
   { FILE_RETMIN, blob_retmin, blob_retmin_len },
+  { FILE_DONT, blob_dont, blob_dont_len },
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
   { FILE_SONG, blob_song, blob_song_len },
@@ -1796,26 +1799,27 @@ void setup() {
   Console.begin();
 
   // Arbiter + CBTLV3257 wiring help (this MCU = Owner A)
-  Console.println("External SPI arbiter wiring (this MCU = Owner A):");
+  /*Console.println("External SPI arbiter wiring (this MCU = Owner A):");
   Console.println("  REQ_A:   RP2040 GP4  -> ATtiny861A PA0 (active-low request)");
   Console.println("  GRANT_A: RP2040 GP5  <- ATtiny861A PA4 (OWNER_A, high = granted)");
   Console.println("CBTLV3257 control (driven by ATtiny861A):");
-  Console.println("  S (select):    <- PB3  (B side selected when HIGH; A side when LOW)");
-  Console.println("  OE# (enable):  <- PB4  (active LOW; bus connected when LOW)");
-  Console.println("CBTLV3257 channel map (A = this MCU, B = co-processor, Y = shared to memories):");
-  Console.println("  CH0 (SCK):   A<- GP10 (SCK_A),   B<- <co-proc SCK>,   Y-> SCK to PSRAM/NOR/NAND");
-  Console.println("  CH1 (MOSI):  A<- GP11 (MOSI_A),  B<- <co-proc MOSI>,  Y-> MOSI/DI to PSRAM/NOR/NAND");
-  Console.println("  CH2 (MISO):  A-> GP12 (MISO_A),  B-> <co-proc MISO>,  Y<- MISO/DO from PSRAM/NOR/NAND");
-  Console.println("  CH3 (opt):   Use for CS-bank enable or HOLD#/WP# if desired; else leave NC");
+  Console.println("  S (select, pin 1):  <- PB3  (selects between B1 and B2; B side selected when HIGH)");
+  Console.println("  OE# (enable, pin 15): <- PB4  (active LOW; bus connected when LOW)");
+  Console.println("  Vcc: pin 16, GND: pin 8");
+  Console.println("CBTLV3257 channel map:");
+  Console.println("  CH0 (SCK):   Master A -> pin 2  (1B1), \tMaster B -> pin 3  (1B2), \tY (shared) -> pin 4  (1A)");
+  Console.println("  CH1 (MOSI):  Master A -> pin 5  (2B1), \tMaster B -> pin 6  (2B2), \tY (shared) -> pin 7  (2A)");
+  Console.println("  CH2 (MISO):  Master A -> pin 11 (3B1), \tMaster B -> pin 10 (3B2), \tY (shared) -> pin 9  (3A)");
+  Console.println("  CH3 (opt):   Master A -> pin 14 (4B1), \tMaster B -> pin 13 (4B2), \tY (shared) -> pin 12 (4A)");
   Console.println("Notes:");
-  Console.println("  - Device CS lines can remain direct from both MCUs; non-owner CS toggles are benign");
-  Console.println("    because only the owner’s SCK/MOSI/MISO are connected through the CBTLV3257.");
-  Console.println();
+  Console.println("  - S = pin 1, OE# = pin 15. Device CS lines may remain direct from each MCU.");
+  Console.println("  - Master A = this MCU");
+  Console.println("  - Master B = co-processor MCU");
+  Console.println("  - Y = shared to memories");
+  Console.println();*/
 
   // Enable arbiter guard (Host A)
-  UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5,
-                                        /*reqActiveLow*/ true, /*grantActiveHigh*/ true,
-                                        /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
+  //UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5, /*reqActiveLow*/ true, /*grantActiveHigh*/ true, /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
 
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
@@ -1827,9 +1831,7 @@ void setup() {
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
     if (!di) continue;
-    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n",
-                   di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName,
-                   (unsigned long long)di->capacityBytes);
+    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
 
   bool nandOk = fsNAND.begin(uniMem);
@@ -1851,8 +1853,7 @@ void setup() {
   Exec.attachCoProc(&coprocLink, COPROC_BAUD);
   updateExecFsTable();
 
-  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n",
-                 (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
+  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {

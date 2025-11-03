@@ -133,6 +133,7 @@ static void autogenBlobWrites() {
   allOk &= ensureBlobIfMissing(FILE_PWMC, blob_pwmc, blob_pwmc_len);
   allOk &= ensureBlobIfMissing(FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len);
   allOk &= ensureBlobIfMissing(FILE_RETMIN, blob_retmin, blob_retmin_len);
+  allOk &= ensureBlobIfMissing(FILE_DONT, blob_dont, blob_dont_len);
   allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
   allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
   allOk &= ensureBlobIfMissing(FILE_SONG, blob_song, blob_song_len);
