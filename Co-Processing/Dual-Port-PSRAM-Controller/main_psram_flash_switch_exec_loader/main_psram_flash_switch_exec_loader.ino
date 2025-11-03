@@ -2,10 +2,11 @@
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
-#define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 1000000UL  // 1 MHz SPI
-#define W25Q_SPI_CLOCK_HZ 1000000UL     // 1 MHz NOR
-#define MX35_SPI_CLOCK_HZ 1000000UL     // 1 MHz NAND
+//#define UNIFIED_SPI_INSTANCE SPI1
+#define UNIFIED_SPI_INSTANCE SPI
+#define UNIFIED_SPI_CLOCK_HZ 104000000UL  // 1 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 104000000UL     // 1 MHz NOR
+#define MX35_SPI_CLOCK_HZ 104000000UL     // 1 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
 // ------- Co-Processor over Software Serial (framed RPC) -------
 #include <SoftwareSerial.h>
@@ -60,7 +61,7 @@ static ConsolePrint Console;  // Console wrapper
 const uint8_t PIN_FLASH_MISO = 4;               // GP4
 const uint8_t PIN_PSRAM_MISO = PIN_FLASH_MISO;  // GP4
 const uint8_t PIN_FLASH_MOSI = 3;               // GP3
-const uint8_t PIN_PSRAM_MOSI = PIN_FLASH_MISO;  // GP3
+const uint8_t PIN_PSRAM_MOSI = PIN_FLASH_MOSI;  // GP3
 const uint8_t PIN_FLASH_SCK = 6;                // GP6
 const uint8_t PIN_PSRAM_SCK = PIN_FLASH_SCK;    // GP6
 const uint8_t PIN_FLASH_CS0 = 8;                // GP8
@@ -1823,7 +1824,8 @@ void setup() {
 
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
-  uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
+  //uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
+  uniMem.setCsList({ PIN_NAND_CS });
 
   // Keep slow scan for robustness
   size_t found = uniMem.rescan(50000UL);
@@ -1842,7 +1844,7 @@ void setup() {
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
 
   bindActiveFs(g_storage);
-  bool mounted = activeFs.mount(g_storage == StorageBackend::PSRAM_BACKEND /*autoFormatIfEmpty*/);
+  bool mounted = activeFs.mount(g_storage == StorageBackend::NAND /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
