@@ -4,21 +4,28 @@
 */
 #include <Arduino.h>
 // ------- Shared HW SPI (FLASH + PSRAM) -------
+#define CONSOLE_TFT_ENABLE
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 104000000UL  // 104 MHz SPI
-#define W25Q_SPI_CLOCK_HZ 104000000UL     // 104 MHz NOR
-#define MX35_SPI_CLOCK_HZ 104000000UL     // 104 MHz NAND
+#define UNIFIED_SPI_CLOCK_HZ 10400000UL  // 104 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 10400000UL     // 104 MHz NOR
+#define MX35_SPI_CLOCK_HZ 10400000UL     // 104 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
 #include "BusArbiterWithISP.h"
 #include "rp_selfupdate.h"
 #include <SoftwareSerial.h>
 #include "CoProcProto.h"
 #include "CoProcLang.h"
+// MCP4921 DAC
+#include "MCP_DAC.h"
+//MCP4921 MCP(19, 18);  //  SW SPI
+MCP4921 MCP;  //  HW SPI
+volatile int x;
+uint32_t start, stop;
 // ------- Debug toggle -------
 #ifndef COPROC_DEBUG
-#define COPROC_DEBUG 1
+#define COPROC_DEBUG 0
 #endif
 #if COPROC_DEBUG
 #define DBG(...) Serial.printf(__VA_ARGS__)
@@ -30,12 +37,22 @@
 // ------- Pins (as requested) -------
 static const uint8_t PIN_RX = 0;  // GP0  (co-processor RX)
 static const uint8_t PIN_TX = 1;  // GP1  (co-processor TX)
+// Default PWM audio pin for piezo buzzer
+static const uint8_t PWM_AUDIO_PIN = 3;  // GP3 default; adjust if needed
 // ------- Software serial config -------
 #ifndef SOFT_BAUD
 //#define SOFT_BAUD 230400
 #define SOFT_BAUD 115200
 #endif
 static SoftwareSerial coproclink(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
+struct WavInfo {
+  uint32_t dataOffset = 0;
+  uint32_t dataSize = 0;
+  uint16_t channels = 0;
+  uint16_t bitsPerSample = 0;
+  uint32_t sampleRate = 0;
+  uint16_t audioFormat = 0;  // 1 = PCM
+};
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -69,7 +86,6 @@ static ConsolePrint Console;
 #define FILE_PT1 "pt1"
 #define FILE_PT2 "pt2"
 #define FILE_PT3 "pt3"
-
 // ------- Mailbox / cancel (shared with blob + script) -------
 struct BlobReg {
   // ========== Blob registry ==========
@@ -114,14 +130,13 @@ enum class StorageBackend {
   PSRAM_BACKEND,
   NAND,
 };
-static StorageBackend g_storage = StorageBackend::PSRAM_BACKEND;
+static StorageBackend g_storage = StorageBackend::Flash;
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
 PSRAMUnifiedSimpleFS fsPSRAM;
 MX35UnifiedSimpleFS fsNAND;
-
-// ======== SimpleFS active facade (PSRAM only on co-processor) ========
+// ======== SimpleFS active facade (support Flash/PSRAM/NAND like main) ========
 #define FS_SECTOR_SIZE 4096
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -144,14 +159,12 @@ struct ActiveFS {
   static constexpr uint32_t PAGE_SIZE = 256;
   static constexpr size_t MAX_NAME = 32;
 } activeFs;
-
 struct FsIndexEntry {
   char name[ActiveFS::MAX_NAME + 1];
   uint32_t size;
   bool deleted;
   uint32_t seq;
 };
-
 struct FSIface {
   bool (*mount)(bool);
   bool (*exists)(const char*);
@@ -161,8 +174,7 @@ struct FSIface {
   uint32_t (*readFile)(const char*, uint8_t*, uint32_t);
   bool (*getFileInfo)(const char*, uint32_t&, uint32_t&, uint32_t&);
 };
-
-// Helper to get device for specific backend (used by fscp)
+// Helper to get device for specific backend
 static inline UnifiedSpiMem::MemDevice* deviceForBackend(StorageBackend backend) {
   switch (backend) {
     case StorageBackend::Flash: return fsFlash.raw().device();
@@ -171,7 +183,6 @@ static inline UnifiedSpiMem::MemDevice* deviceForBackend(StorageBackend backend)
     default: return nullptr;
   }
 }
-
 static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
   switch (g_storage) {
     case StorageBackend::Flash: return fsFlash.raw().device();
@@ -180,7 +191,6 @@ static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
     default: return nullptr;
   }
 }
-
 static inline int fsReplaceMode() {
   switch (g_storage) {
     case StorageBackend::Flash:
@@ -192,8 +202,6 @@ static inline int fsReplaceMode() {
   }
   return 0;
 }
-
-// Replace mode per backend (for fscp)
 static inline int fsReplaceModeFor(StorageBackend b) {
   switch (b) {
     case StorageBackend::Flash:
@@ -205,56 +213,156 @@ static inline int fsReplaceModeFor(StorageBackend b) {
   }
   return 0;
 }
-
-static void bindActiveFsPSRAM() {
-  activeFs.mount = [](bool b) {
-    return fsPSRAM.mount(b);
-  };
-  activeFs.format = []() {
-    return fsPSRAM.format();
-  };
-  activeFs.wipeChip = []() {
-    return fsPSRAM.wipeChip();
-  };
-  activeFs.exists = [](const char* n) {
-    return fsPSRAM.exists(n);
-  };
-  activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-    return fsPSRAM.createFileSlot(n, r, d, s);
-  };
-  activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-    return fsPSRAM.writeFile(n, d, s, m);
-  };
-  activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-    return fsPSRAM.writeFileInPlace(n, d, s, a);
-  };
-  activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-    return fsPSRAM.readFile(n, b, sz);
-  };
-  activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
-    return fsPSRAM.readFileRange(n, off, b, l);
-  };
-  activeFs.getFileSize = [](const char* n, uint32_t& s) {
-    return fsPSRAM.getFileSize(n, s);
-  };
-  activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-    return fsPSRAM.getFileInfo(n, a, s, c);
-  };
-  activeFs.deleteFile = [](const char* n) {
-    return fsPSRAM.deleteFile(n);
-  };
-  activeFs.listFilesToSerial = []() {
-    fsPSRAM.listFilesToSerial();
-  };
-  activeFs.nextDataAddr = []() {
-    return fsPSRAM.nextDataAddr();
-  };
-  activeFs.capacity = []() {
-    return fsPSRAM.capacity();
-  };
-  activeFs.dataRegionStart = []() {
-    return fsPSRAM.dataRegionStart();
-  };
+// Bind ActiveFS like the main sketch
+static void bindActiveFs(StorageBackend backend) {
+  if (backend == StorageBackend::Flash) {
+    activeFs.mount = [](bool b) {
+      return fsFlash.mount(b);
+    };
+    activeFs.format = []() {
+      return fsFlash.format();
+    };
+    activeFs.wipeChip = []() {
+      return fsFlash.wipeChip();
+    };
+    activeFs.exists = [](const char* n) {
+      return fsFlash.exists(n);
+    };
+    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsFlash.createFileSlot(n, r, d, s);
+    };
+    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
+    };
+    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsFlash.writeFileInPlace(n, d, s, a);
+    };
+    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsFlash.readFile(n, b, sz);
+    };
+    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
+      return fsFlash.readFileRange(n, off, b, l);
+    };
+    activeFs.getFileSize = [](const char* n, uint32_t& s) {
+      return fsFlash.getFileSize(n, s);
+    };
+    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsFlash.getFileInfo(n, a, s, c);
+    };
+    activeFs.deleteFile = [](const char* n) {
+      return fsFlash.deleteFile(n);
+    };
+    activeFs.listFilesToSerial = []() {
+      fsFlash.listFilesToSerial();
+    };
+    activeFs.nextDataAddr = []() {
+      return fsFlash.nextDataAddr();
+    };
+    activeFs.capacity = []() {
+      return fsFlash.capacity();
+    };
+    activeFs.dataRegionStart = []() {
+      return fsFlash.dataRegionStart();
+    };
+  } else if (backend == StorageBackend::NAND) {
+    activeFs.mount = [](bool b) {
+      return fsNAND.mount(b);
+    };
+    activeFs.format = []() {
+      return fsNAND.format();
+    };
+    activeFs.wipeChip = []() {
+      return fsNAND.wipeChip();
+    };
+    activeFs.exists = [](const char* n) {
+      return fsNAND.exists(n);
+    };
+    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsNAND.createFileSlot(n, r, d, s);
+    };
+    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
+    };
+    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsNAND.writeFileInPlace(n, d, s, a);
+    };
+    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsNAND.readFile(n, b, sz);
+    };
+    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
+      return fsNAND.readFileRange(n, off, b, l);
+    };
+    activeFs.getFileSize = [](const char* n, uint32_t& s) {
+      return fsNAND.getFileSize(n, s);
+    };
+    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsNAND.getFileInfo(n, a, s, c);
+    };
+    activeFs.deleteFile = [](const char* n) {
+      return fsNAND.deleteFile(n);
+    };
+    activeFs.listFilesToSerial = []() {
+      fsNAND.listFilesToSerial();
+    };
+    activeFs.nextDataAddr = []() {
+      return fsNAND.nextDataAddr();
+    };
+    activeFs.capacity = []() {
+      return fsNAND.capacity();
+    };
+    activeFs.dataRegionStart = []() {
+      return fsNAND.dataRegionStart();
+    };
+  } else {
+    activeFs.mount = [](bool b) {
+      return fsPSRAM.mount(b);
+    };
+    activeFs.format = []() {
+      return fsPSRAM.format();
+    };
+    activeFs.wipeChip = []() {
+      return fsPSRAM.wipeChip();
+    };
+    activeFs.exists = [](const char* n) {
+      return fsPSRAM.exists(n);
+    };
+    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsPSRAM.createFileSlot(n, r, d, s);
+    };
+    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsPSRAM.writeFile(n, d, s, m);
+    };
+    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsPSRAM.writeFileInPlace(n, d, s, a);
+    };
+    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsPSRAM.readFile(n, b, sz);
+    };
+    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
+      return fsPSRAM.readFileRange(n, off, b, l);
+    };
+    activeFs.getFileSize = [](const char* n, uint32_t& s) {
+      return fsPSRAM.getFileSize(n, s);
+    };
+    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsPSRAM.getFileInfo(n, a, s, c);
+    };
+    activeFs.deleteFile = [](const char* n) {
+      return fsPSRAM.deleteFile(n);
+    };
+    activeFs.listFilesToSerial = []() {
+      fsPSRAM.listFilesToSerial();
+    };
+    activeFs.nextDataAddr = []() {
+      return fsPSRAM.nextDataAddr();
+    };
+    activeFs.capacity = []() {
+      return fsPSRAM.capacity();
+    };
+    activeFs.dataRegionStart = []() {
+      return fsPSRAM.dataRegionStart();
+    };
+  }
 }
 static inline uint32_t getEraseAlign() {
   UnifiedSpiMem::MemDevice* dev = activeFsDevice();
@@ -262,25 +370,144 @@ static inline uint32_t getEraseAlign() {
   uint32_t e = dev->eraseSize();
   return (e > 0) ? e : ActiveFS::SECTOR_SIZE;
 }
-
-// Erase alignment helper for a specific backend (for fscp)
 static inline uint32_t getEraseAlignFor(StorageBackend b) {
   UnifiedSpiMem::MemDevice* dev = deviceForBackend(b);
   if (!dev) return ActiveFS::SECTOR_SIZE;
   uint32_t e = dev->eraseSize();
   return (e > 0) ? e : ActiveFS::SECTOR_SIZE;
 }
-
 #include "MemDiag.h"
 #include "BlobGen.h"
 #include "PSRAMDiag.h"
-//#include "CoProcRPCHelpers.h"
 //#include "NanoishTextEditor.h"
 #include "SHA256hashcmd.h"
 #include "Base64Utils.h"
 #include "InputHelper.h"
 #include "CrossFSUtils.h"
 #include "CompilerHelpers.h"
+void performance_test() {
+  Console.println();
+  Console.println(__FUNCTION__);
+  start = micros();
+  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
+    x = MCP.write(value, 0);
+  }
+  stop = micros();
+  Console.print(MCP.maxValue());
+  Console.print(" x MCP.write():\t");
+  Console.print(stop - start);
+  Console.print("\t");
+  Console.println((stop - start) / (MCP.maxValue() + 1.0));
+  delay(10);
+  start = micros();
+  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
+    MCP.fastWriteA(value);
+  }
+  stop = micros();
+  Console.print(MCP.maxValue());
+  Console.print(" x MCP.fastWriteA():\t");
+  Console.print(stop - start);
+  Console.print("\t");
+  Console.println((stop - start) / (MCP.maxValue() + 1.0));
+  delay(10);
+}
+// ===== MCP23S17 via Adafruit MCP23X17 (SPI1) =====
+#include <SPI.h>
+#include <Adafruit_MCP23X17.h>
+static const uint8_t PIN_MCP23S17_CS = 6;  // GP6 CS for MCP23S17 on SPI1
+static Adafruit_MCP23X17 mcp;
+// Map keypad to MCP23S17 pins (0..7 = GPA0..GPA7)
+// Wiring: keypad pins 1..8 = C1,C2,C3,C4,R1,R2,R3,R4 connected to GPA7..GPA0
+static const uint8_t COLS[4] = { 4, 5, 6, 7 };  // GPA7..GPA4 (columns we drive)
+static const uint8_t ROWS[4] = { 0, 1, 2, 3 };  // GPA3..GPA0 (rows we read)
+// Debounce state
+static uint16_t g_maskStable = 0;
+static uint16_t g_maskPrev = 0;
+static uint8_t g_stableCount = 0;
+static uint32_t g_lastPollMs = 0;
+static void printMatrix16(uint16_t mask) {
+  Serial.print("KeyMask: 0x");
+  if (mask < 0x1000) Serial.print('0');
+  if (mask < 0x0100) Serial.print('0');
+  if (mask < 0x0010) Serial.print('0');
+  Serial.println(mask, HEX);
+  for (uint8_t r = 0; r < 4; ++r) {
+    for (uint8_t c = 0; c < 4; ++c) {
+      uint8_t bit = c * 4 + r;
+      bool pressed = (mask >> bit) & 1;
+      Serial.print(pressed ? '#' : '.');
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+  Serial.println();
+}
+static bool mcpInit() {
+  pinMode(PIN_MCP23S17_CS, OUTPUT);
+  digitalWrite(PIN_MCP23S17_CS, HIGH);
+  // Ensure SPI1 is configured to the same pins as uniMem (SCK=14, MOSI=15, MISO=12)
+  SPI1.setSCK(14);
+  SPI1.setMOSI(15);
+  SPI1.setMISO(12);
+  SPI1.begin();
+  if (!mcp.begin_SPI(PIN_MCP23S17_CS, &SPI1)) {
+    Console.println("MCP23S17: begin_SPI failed (check CS wiring/power).");
+    return false;
+  }
+  // Rows as INPUT_PULLUP (OK alongside external 10k pull-ups)
+  for (uint8_t i = 0; i < 4; ++i) {
+    mcp.pinMode(ROWS[i], INPUT_PULLUP);
+  }
+  // Columns tri-stated by default
+  for (uint8_t i = 0; i < 4; ++i) {
+    mcp.pinMode(COLS[i], INPUT);
+  }
+  // Clear state
+  g_maskStable = g_maskPrev = 0;
+  g_stableCount = 0;
+  g_lastPollMs = 0;
+  return true;
+}
+static uint16_t mcpScanMatrix16() {
+  uint16_t mask = 0;
+  for (uint8_t c = 0; c < 4; ++c) {
+    // Tri-state all columns
+    for (uint8_t i = 0; i < 4; ++i) {
+      mcp.pinMode(COLS[i], INPUT);
+    }
+    // Drive this column low
+    mcp.pinMode(COLS[c], OUTPUT);
+    mcp.digitalWrite(COLS[c], LOW);
+    delayMicroseconds(30);  // settle
+    // Read both banks and grab A-port (lower 8 bits)
+    uint16_t ab = mcp.readGPIOAB();
+    uint8_t porta = (uint8_t)(ab & 0xFF);
+    // Rows are on GPA0..GPA3 -> take low nibble, invert (pull-ups)
+    uint8_t rows = (uint8_t)((~porta) & 0x0F);
+    mask |= (uint16_t)rows << (c * 4);
+  }
+  // Idle: tri-state columns
+  for (uint8_t i = 0; i < 4; ++i) {
+    mcp.pinMode(COLS[i], INPUT);
+  }
+  return mask;
+}
+static void keypadPollSPI() {
+  const uint32_t now = millis();
+  if ((uint32_t)(now - g_lastPollMs) < 5) return;  // ~5ms cadence
+  g_lastPollMs = now;
+  uint16_t cur = mcpScanMatrix16();
+  if (cur == g_maskPrev) {
+    if (g_stableCount < 3) ++g_stableCount;
+  } else {
+    g_stableCount = 0;
+    g_maskPrev = cur;
+  }
+  if (g_stableCount >= 2 && cur != g_maskStable) {
+    g_maskStable = cur;
+    printMatrix16(g_maskStable);
+  }
+}
 
 // ========= Minimal interactive serial console (USB Serial) =========
 static char g_lineBuf[256];
@@ -310,9 +537,7 @@ static inline void compiler_barrier() {
   __asm__ __volatile__("" ::
                          : "memory");
 }
-// ========= End console scaffolding =========
-
-// ===== Directory index helpers (before buildFsIndex and console usage) =====
+// ===== Directory index helpers =====
 static inline uint32_t rd32_be(const uint8_t* p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
 }
@@ -481,7 +706,6 @@ static const char* lastSlash(const char* s) {
   const char* p = strrchr(s, '/');
   return p ? (p + 1) : s;
 }
-
 // ------- ISP mode state -------
 static volatile bool g_isp_active = false;
 static inline void serviceISPIfActive() {
@@ -498,7 +722,320 @@ static uint8_t* g_reqBuf = nullptr;
 static uint8_t* g_respBuf = nullptr;
 static const uint32_t RESP_MAX = 8192;
 static const uint32_t REQ_MAX = 8192;
-
+// ========= WAV playback helpers (unsigned 8-bit PCM, mono) =========
+static inline uint16_t rd16le(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+static inline uint32_t rd32le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static bool parseWavHeader(const char* fn, WavInfo& wi, uint32_t fileSize) {
+  uint8_t head[12];
+  if (activeFs.readFileRange(fn, 0, head, sizeof(head)) != sizeof(head)) {
+    Console.println("wav: failed to read header");
+    return false;
+  }
+  if (memcmp(head, "RIFF", 4) != 0 || memcmp(head + 8, "WAVE", 4) != 0) {
+    Console.println("wav: not a RIFF/WAVE file");
+    return false;
+  }
+  uint32_t off = 12;
+  bool gotFmt = false, gotData = false;
+  while (off + 8 <= fileSize && !(gotFmt && gotData)) {
+    uint8_t chdr[8];
+    if (activeFs.readFileRange(fn, off, chdr, 8) != 8) break;
+    uint32_t cid = rd32le(chdr);
+    uint32_t csz = rd32le(chdr + 4);
+    const char id0 = (char)(cid & 0xFF);
+    const char id1 = (char)((cid >> 8) & 0xFF);
+    const char id2 = (char)((cid >> 16) & 0xFF);
+    const char id3 = (char)((cid >> 24) & 0xFF);
+    if (id0 == 'f' && id1 == 'm' && id2 == 't' && id3 == ' ') {
+      uint8_t fmt[32];
+      uint32_t toRead = csz > sizeof(fmt) ? sizeof(fmt) : csz;
+      if (activeFs.readFileRange(fn, off + 8, fmt, toRead) != toRead) {
+        Console.println("wav: failed to read fmt");
+        return false;
+      }
+      wi.audioFormat = rd16le(fmt + 0);
+      wi.channels = rd16le(fmt + 2);
+      wi.sampleRate = rd32le(fmt + 4);
+      wi.bitsPerSample = rd16le(fmt + 14);
+      gotFmt = true;
+    } else if (id0 == 'd' && id1 == 'a' && id2 == 't' && id3 == 'a') {
+      wi.dataOffset = off + 8;
+      wi.dataSize = (off + 8 + csz <= fileSize) ? csz : (fileSize > off + 8 ? (fileSize - (off + 8)) : 0);
+      gotData = true;
+    }
+    uint32_t adv = 8 + csz;
+    if (adv & 1) adv++;
+    off += adv;
+  }
+  if (!gotFmt || !gotData) {
+    Console.println("wav: missing fmt or data chunk");
+    return false;
+  }
+  if (wi.audioFormat != 1) {
+    Console.println("wav: only PCM supported");
+    return false;
+  }
+  if (wi.channels != 1) {
+    Console.println("wav: only mono supported");
+    return false;
+  }
+  if (wi.bitsPerSample != 8) {
+    Console.println("wav: only 8-bit samples supported");
+    return false;
+  }
+  if (wi.sampleRate < 2000 || wi.sampleRate > 96000) {
+    Console.println("wav: unreasonable sample rate");
+    return false;
+  }
+  return true;
+}
+static bool wavPlayFile(const char* fn) {
+  if (!fn || !*fn) {
+    Console.println("usage: wav play <file>");
+    return false;
+  }
+  if (!activeFs.exists(fn)) {
+    Console.println("wav: file not found");
+    return false;
+  }
+  uint32_t fsz = 0;
+  if (!activeFs.getFileSize(fn, fsz) || fsz < 44) {
+    Console.println("wav: bad file size");
+    return false;
+  }
+  WavInfo wi{};
+  if (!parseWavHeader(fn, wi, fsz)) return false;
+  Console.printf("wav: %lu Hz, %u-bit, mono, data=%lu bytes (DAC)\n",
+                 (unsigned long)wi.sampleRate, (unsigned)wi.bitsPerSample, (unsigned long)wi.dataSize);
+  Console.println("Press 'q' to stop");
+  const uint32_t q = 1000000u / wi.sampleRate;
+  const uint32_t r = 1000000u % wi.sampleRate;
+  uint32_t acc = 0;
+  const uint32_t CHUNK = 256;
+  uint8_t buf[CHUNK];
+  uint32_t left = wi.dataSize;
+  uint32_t off = wi.dataOffset;
+  uint32_t nextT = micros();
+  g_cancel_flag = 0;
+  while (left > 0) {
+    uint32_t n = (left > CHUNK) ? CHUNK : left;
+    uint32_t got = activeFs.readFileRange(fn, off, buf, n);
+    if (got != n) {
+      Console.println("wav: read error");
+      return false;
+    }
+    off += n;
+    left -= n;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (Serial.available()) {
+        int c = Serial.peek();
+        if (c == 'q' || c == 'Q') {
+          (void)Serial.read();
+          Console.println("\n(wav stopped by user)");
+          return true;
+        }
+      }
+      uint16_t v12 = ((uint16_t)buf[i]) << 4;  // 8->12 bit
+      MCP.fastWriteA(v12);
+      uint32_t now = micros();
+      while ((int32_t)(now - nextT) < 0) {
+        tight_loop_contents();
+        yield();
+        now = micros();
+      }
+      nextT += q;
+      acc += r;
+      if (acc >= wi.sampleRate) {
+        nextT += 1;
+        acc -= wi.sampleRate;
+      }
+      if (g_cancel_flag) {
+        Console.println("\n(wav canceled)");
+        g_cancel_flag = 0;
+        return true;
+      }
+    }
+    serviceISPIfActive();
+    tight_loop_contents();
+    yield();
+  }
+  Console.println("\n(wav done)");
+  return true;
+}
+// PWM playback for piezo buzzer: unsigned 8-bit mono
+static bool wavPlayPWMFile(const char* fn, int pin /*optional override, <0 for default*/) {
+  if (!fn || !*fn) {
+    Console.println("usage: wav playpwm <file> [pin]");
+    return false;
+  }
+  if (!activeFs.exists(fn)) {
+    Console.println("wav: file not found");
+    return false;
+  }
+  uint32_t fsz = 0;
+  if (!activeFs.getFileSize(fn, fsz) || fsz < 44) {
+    Console.println("wav: bad file size");
+    return false;
+  }
+  WavInfo wi{};
+  if (!parseWavHeader(fn, wi, fsz)) return false;
+  uint8_t usePin = (pin >= 0 && pin <= 29) ? (uint8_t)pin : PWM_AUDIO_PIN;
+  pinMode(usePin, OUTPUT);
+  // Configure PWM: fast carrier, 8-bit range
+  const uint32_t PWM_CARRIER_HZ = 62500;  // ~62.5kHz carrier
+  analogWriteRange(255);
+  analogWriteFreq(PWM_CARRIER_HZ);
+  analogWrite(usePin, 128);  // mid-level idle
+  Console.printf("wav: %lu Hz, %u-bit, mono, data=%lu bytes (PWM on GP%u)\n",
+                 (unsigned long)wi.sampleRate, (unsigned)wi.bitsPerSample, (unsigned long)wi.dataSize, (unsigned)usePin);
+  Console.println("Press 'q' to stop");
+  const uint32_t q = 1000000u / wi.sampleRate;
+  const uint32_t r = 1000000u % wi.sampleRate;
+  uint32_t acc = 0;
+  const uint32_t CHUNK = 256;
+  uint8_t buf[CHUNK];
+  uint32_t left = wi.dataSize;
+  uint32_t off = wi.dataOffset;
+  uint32_t nextT = micros();
+  g_cancel_flag = 0;
+  while (left > 0) {
+    uint32_t n = (left > CHUNK) ? CHUNK : left;
+    uint32_t got = activeFs.readFileRange(fn, off, buf, n);
+    if (got != n) {
+      Console.println("wav: read error");
+      analogWrite(usePin, 0);
+      return false;
+    }
+    off += n;
+    left -= n;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (Serial.available()) {
+        int c = Serial.peek();
+        if (c == 'q' || c == 'Q') {
+          (void)Serial.read();
+          analogWrite(usePin, 0);
+          Console.println("\n(wav stopped by user)");
+          return true;
+        }
+      }
+      analogWrite(usePin, buf[i]);  // duty 0..255
+      uint32_t now = micros();
+      while ((int32_t)(now - nextT) < 0) {
+        tight_loop_contents();
+        yield();
+        now = micros();
+      }
+      nextT += q;
+      acc += r;
+      if (acc >= wi.sampleRate) {
+        nextT += 1;
+        acc -= wi.sampleRate;
+      }
+      if (g_cancel_flag) {
+        Console.println("\n(wav canceled)");
+        g_cancel_flag = 0;
+        analogWrite(usePin, 0);
+        return true;
+      }
+    }
+    serviceISPIfActive();
+    tight_loop_contents();
+    yield();
+  }
+  analogWrite(usePin, 0);
+  Console.println("\n(wav done)");
+  return true;
+}
+// "PWMDAC" playback (same scheduling/tunables style as PWM, but to DAC).
+// 8-bit samples before mapping to 12-bit DAC.
+static bool wavPlayPWMDACFile(const char* fn) {
+  if (!fn || !*fn) {
+    MCP.fastWriteA(0);
+    Console.println("usage: wav playpwmdac <file>");
+    return false;
+  }
+  if (!activeFs.exists(fn)) {
+    MCP.fastWriteA(0);
+    Console.println("wav: file not found");
+    return false;
+  }
+  uint32_t fsz = 0;
+  if (!activeFs.getFileSize(fn, fsz) || fsz < 44) {
+    MCP.fastWriteA(0);
+    Console.println("wav: bad file size");
+    return false;
+  }
+  WavInfo wi{};
+  if (!parseWavHeader(fn, wi, fsz)) return false;
+  // Force 50% gain (ignore any user-provided gain)
+  const int gainPercent = 50;
+  Console.printf("wav: %lu Hz, %u-bit, mono, data=%lu bytes (PWMDAC gain=%d%%)\n", (unsigned long)wi.sampleRate, (unsigned)wi.bitsPerSample, (unsigned long)wi.dataSize, gainPercent);
+  Console.println("Press 'q' to stop");
+  const uint32_t q = 1000000u / wi.sampleRate;
+  const uint32_t r = 1000000u % wi.sampleRate;
+  uint32_t acc = 0;
+  const uint32_t CHUNK = 256;
+  uint8_t buf[CHUNK];
+  uint32_t left = wi.dataSize;
+  uint32_t off = wi.dataOffset;
+  uint32_t nextT = micros();
+  g_cancel_flag = 0;
+  while (left > 0) {
+    uint32_t n = (left > CHUNK) ? CHUNK : left;
+    uint32_t got = activeFs.readFileRange(fn, off, buf, n);
+    if (got != n) {
+      MCP.fastWriteA(0);
+      Console.println("wav: read error");
+      return false;
+    }
+    off += n;
+    left -= n;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (Serial.available()) {
+        int c = Serial.peek();
+        if (c == 'q' || c == 'Q') {
+          (void)Serial.read();
+          MCP.fastWriteA(0);
+          Console.println("\n(wav stopped by user)");
+          return true;
+        }
+      }
+      // Scale 8-bit unsigned sample with fixed 50% gain, map to 12-bit
+      uint32_t s = buf[i];                                          // 0..255
+      uint32_t v = (s * 16u * (uint32_t)gainPercent + 50u) / 100u;  // scaled 12-bit approx
+      if (v > 4095u) v = 4095u;
+      MCP.fastWriteA((uint16_t)v);
+      uint32_t now = micros();
+      while ((int32_t)(now - nextT) < 0) {
+        tight_loop_contents();
+        yield();
+        now = micros();
+      }
+      nextT += q;
+      acc += r;
+      if (acc >= wi.sampleRate) {
+        nextT += 1;
+        acc -= wi.sampleRate;
+      }
+      if (g_cancel_flag) {
+        MCP.fastWriteA(0);
+        Console.println("\n(wav canceled)");
+        g_cancel_flag = 0;
+        return true;
+      }
+    }
+    serviceISPIfActive();
+    tight_loop_contents();
+    yield();
+  }
+  MCP.fastWriteA(0);
+  Console.println("\n(wav done)");
+  return true;
+}
 // ========= Console command handler =========
 static char g_cwd[ActiveFS::MAX_NAME + 1] = "";  // "" = root
 static void cmdDf() {
@@ -515,7 +1052,7 @@ static void cmdDf() {
     const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
     const uint32_t dirUsed = dirBytesUsedEstimate();
     const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
-    Console.println("Filesystem (PSRAM):");
+    Console.println("Filesystem (active):");
     Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
     Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
     Console.printf("  FS data: %lu used (", (unsigned long)dataUsed);
@@ -590,15 +1127,20 @@ static bool touchPath(const char* cwd, const char* arg) {
 static void printHelp() {
   Console.println("Co-Processor Console Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
-  Console.println("  files                        - list files in PSRAM FS");
+  Console.println("  storage                      - show active storage");
+  Console.println("  storage flash|psram|nand     - switch storage backend");
+  Console.println("  blobs                        - list compiled-in blobs");
+  Console.println("  autogen                      - auto-create enabled blobs if missing");
+  Console.println("  writeblob <file> <blobId>    - create/update file from blob");
+  Console.println("  files                        - list files in active FS");
   Console.println("  info <file>                  - show file addr/size/cap");
   Console.println("  dump <file> <nbytes>         - hex dump head of file");
   Console.println("  mkSlot <file> <reserve>      - create sector-aligned slot");
-  Console.println("  cat <file> [n]               - print file contents (truncates if very large)");
+  Console.println("  cat <file> [n]               - print file contents (truncates if large)");
+  Console.println("  cp <src> <dst|folder/>       - copy file (within active FS)");
+  Console.println("  mv <src> <dst|folder/>       - move/rename file (within active FS)");
   Console.println("  del <file>                   - delete a file");
   Console.println("  rm <file>                    - alias for 'del'");
-  Console.println("  cp <src> <dst|folder/>       - copy file (within PSRAM FS)");
-  Console.println("  mv <src> <dst|folder/>       - move/rename file (within PSRAM FS)");
   Console.println("  mkdir <path>                 - create folder marker");
   Console.println("  touch <path|name|folder/>    - create empty file or folder marker");
   Console.println("  pwd                          - show current folder (\"/\" = root)");
@@ -607,9 +1149,17 @@ static void printHelp() {
   Console.println("  rmdir <path> [-r]            - remove folder; -r deletes all children");
   Console.println("  df                           - show device and FS usage");
   Console.println("  rescanfs                     - rescan SPI devices");
-  Console.println("  format                       - format PSRAM FS");
-  Console.println("  wipe                         - erase PSRAM chip (DANGEROUS)");
+  Console.println("  format                       - format active FS");
+  Console.println("  wipe                         - erase active chip (DANGEROUS)");
   Console.println("  puthex <file> <hex>          - upload binary as hex string");
+  Console.println("  putb64 <file> <base64>       - upload binary as base64 (single arg)");
+  Console.println("  putb64s <file> [expected]    - paste base64; end ESC[201~ / Ctrl-D / '.'");
+  Console.println("  hash <file> [sha256]         - print SHA-256 of file");
+  Console.println("  sha256 <file>                - alias for 'hash <file>'");
+  Console.println("  cc <src> <dst>               - compile Tiny-C to binary");
+  Console.println("  wav play <file>              - play unsigned 8-bit mono WAV via MCP4921 DAC");
+  Console.println("  wav playpwm <file> [pin]     - play unsigned 8-bit mono WAV via PWM (piezo)");
+  Console.println("  wav playpwmdac <file>        - play WAV via DAC");
   Console.println("  meminfo                      - show heap info");
   Console.println("  isp enter|exit               - enter/exit ISP mode on arbiter");
   Console.println("  dacperf                      - run DAC performance test");
@@ -619,9 +1169,63 @@ static void handleCommand(char* line) {
   char* p = line;
   char* t0;
   if (!nextToken(p, t0)) return;
-
   if (!strcmp(t0, "help")) {
     printHelp();
+  } else if (!strcmp(t0, "storage")) {
+    char* tok;
+    if (!nextToken(p, tok)) {
+      Console.print("Active storage: ");
+      switch (g_storage) {
+        case StorageBackend::Flash: Console.println("flash"); break;
+        case StorageBackend::PSRAM_BACKEND: Console.println("psram"); break;
+        case StorageBackend::NAND: Console.println("nand"); break;
+        default: Console.println("unknown"); break;
+      }
+      return;
+    }
+    if (!strcmp(tok, "flash")) {
+      g_storage = StorageBackend::Flash;
+      bindActiveFs(g_storage);
+      bool ok = activeFs.mount(true);
+      Console.println("Switched active storage to FLASH");
+      Console.println(ok ? "Mounted FLASH (auto-format if empty)" : "Mount failed (FLASH)");
+    } else if (!strcmp(tok, "psram")) {
+      g_storage = StorageBackend::PSRAM_BACKEND;
+      bindActiveFs(g_storage);
+      bool ok = activeFs.mount(false);
+      Console.println("Switched active storage to PSRAM");
+      Console.println(ok ? "Mounted PSRAM (no auto-format)" : "Mount failed (PSRAM)");
+    } else if (!strcmp(tok, "nand")) {
+      g_storage = StorageBackend::NAND;
+      bindActiveFs(g_storage);
+      bool ok = activeFs.mount(true);
+      Console.println("Switched active storage to NAND");
+      Console.println(ok ? "Mounted NAND (auto-format if empty)" : "Mount failed (NAND)");
+    } else {
+      Console.println("usage: storage [flash|psram|nand]");
+    }
+  } else if (!strcmp(t0, "blobs")) {
+    listBlobs();
+  } else if (!strcmp(t0, "autogen")) {
+    autogenBlobWrites();
+  } else if (!strcmp(t0, "writeblob")) {
+    char* fn;
+    char* bid;
+    if (!nextToken(p, fn) || !nextToken(p, bid)) {
+      Console.println("usage: writeblob <file> <blobId>");
+      return;
+    }
+    if (strlen(fn) > ActiveFS::MAX_NAME) {
+      Console.println("writeblob: name too long");
+      return;
+    }
+    const BlobReg* br = findBlob(bid);
+    if (!br) {
+      Console.println("unknown blobId; use 'blobs'");
+      return;
+    }
+    if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
+    else Console.println("writeblob failed");
   } else if (!strcmp(t0, "files")) {
     activeFs.listFilesToSerial();
   } else if (!strcmp(t0, "info")) {
@@ -657,8 +1261,7 @@ static void handleCommand(char* line) {
       return;
     }
     uint32_t res = (uint32_t)strtoul(nstr, nullptr, 0);
-    if (activeFs.createFileSlot(fn, res, nullptr, 0)) Console.println("slot created");
-    else Console.println("mkSlot failed");
+    Console.println(activeFs.createFileSlot(fn, res, nullptr, 0) ? "slot created" : "mkSlot failed");
   } else if (!strcmp(t0, "cat")) {
     char* fn;
     char* nstr;
@@ -1132,11 +1735,12 @@ static void handleCommand(char* line) {
       Console.println("puthex: name too long");
       return;
     }
+    // local hex decode (ok to inline here)
     uint8_t* bin = nullptr;
     uint32_t binLen = 0;
-    auto decodeHexString = [](const char* hex, uint8_t*& out, uint32_t& outLen) -> bool {
-      if (!hex) return false;
-      size_t L = strlen(hex);
+    auto decodeHexString = [](const char* s, uint8_t*& out, uint32_t& outLen) -> bool {
+      if (!s) return false;
+      size_t L = strlen(s);
       if (L == 0) {
         out = nullptr;
         outLen = 0;
@@ -1146,15 +1750,14 @@ static void handleCommand(char* line) {
       outLen = (uint32_t)(L / 2);
       out = (uint8_t*)malloc(outLen ? outLen : 1);
       if (!out) return false;
-      auto hexVal = [](char c) -> int {
+      auto hv = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
         if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
         return -1;
       };
       for (size_t i = 0; i < L; i += 2) {
-        int hi = hexVal(hex[i]);
-        int lo = hexVal(hex[i + 1]);
+        int hi = hv(s[i]), lo = hv(s[i + 1]);
         if (hi < 0 || lo < 0) {
           free(out);
           out = nullptr;
@@ -1178,6 +1781,122 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec may reject (needs even bytes).");
     } else Console.println("puthex: write failed");
+  } else if (!strcmp(t0, "putb64")) {
+    char* fn;
+    char* b64;
+    if (!nextToken(p, fn) || !nextToken(p, b64)) {
+      Console.println("usage: putb64 <file> <base64>");
+      Console.println("tip: base64 -w0 your.bin");
+      return;
+    }
+    if (strlen(fn) > ActiveFS::MAX_NAME) {
+      Console.println("putb64: name too long");
+      return;
+    }
+    uint8_t* bin = nullptr;
+    uint32_t binLen = 0;
+    if (!decodeBase64String(b64, bin, binLen)) {
+      Console.println("putb64: decode failed");
+      return;
+    }
+    bool ok = writeBinaryToFS(fn, bin, binLen);
+    free(bin);
+    if (ok) {
+      Console.print("putb64: wrote ");
+      Console.print(binLen);
+      Console.print(" bytes to ");
+      Console.println(fn);
+      if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec may reject (needs even bytes).");
+    } else Console.println("putb64: write failed");
+  } else if (!strcmp(t0, "putb64s")) {
+    char* fn;
+    char* opt;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: putb64s <file> [expected_decoded_size]");
+      return;
+    }
+    if (strlen(fn) > ActiveFS::MAX_NAME) {
+      Console.println("putb64s: name too long");
+      return;
+    }
+    uint32_t expected = 0;
+    if (nextToken(p, opt)) expected = (uint32_t)strtoul(opt, nullptr, 0);
+    if (g_b64u.active) {
+      Console.println("putb64s: another upload is active");
+      return;
+    }
+    b64uStart(fn, expected);
+    return;  // loop will pump b64u
+  } else if (!strcmp(t0, "hash") || !strcmp(t0, "sha256")) {
+    char* fn;
+    char* algo = nullptr;
+    if (!nextToken(p, fn)) {
+      Console.println("usage: hash <file> [sha256]");
+      return;
+    }
+    if (!strcmp(t0, "hash")) (void)nextToken(p, algo);
+    if (algo && strcmp(algo, "sha256") != 0) {
+      Console.println("hash: only sha256 is supported");
+      return;
+    }
+    uint8_t dig[32];
+    if (!sha256File(fn, dig)) return;
+    printHexLower(dig, sizeof(dig));
+    Serial.write(' ');
+    Serial.println(fn);
+  } else if (!strcmp(t0, "cc")) {
+    char* src;
+    char* dst;
+    if (!nextToken(p, src) || !nextToken(p, dst)) {
+      Console.println("usage: cc <src> <dst>");
+      Console.println("example: cc myprog.c myprog.bin");
+      return;
+    }
+    if (!compileTinyCFileToFile(src, dst)) {
+      Console.println("cc: failed");
+    }
+  } else if (!strcmp(t0, "wav")) {
+    char* sub;
+    if (!nextToken(p, sub)) {
+      Console.println("wav cmds:");
+      Console.println("  wav play <file>              - play unsigned 8-bit mono WAV via MCP4921 DAC");
+      Console.println("  wav playpwm <file> [pin]     - play unsigned 8-bit mono WAV via PWM (piezo)");
+      Console.println("  wav playpwmdac <file>        - play WAV via DAC");
+      return;
+    }
+    if (!strcmp(sub, "play")) {
+      char* fn = nullptr;
+      if (!nextToken(p, fn)) {
+        Console.println("usage: wav play <file>");
+        return;
+      }
+      if (!wavPlayFile(fn)) {
+        Console.println("wav play: failed");
+      }
+    } else if (!strcmp(sub, "playpwm")) {
+      char* fn = nullptr;
+      char* pinStr = nullptr;
+      if (!nextToken(p, fn)) {
+        Console.println("usage: wav playpwm <file> [pin]");
+        return;
+      }
+      int pin = -1;
+      if (nextToken(p, pinStr)) pin = (int)strtol(pinStr, nullptr, 0);
+      if (!wavPlayPWMFile(fn, pin)) {
+        Console.println("wav playpwm: failed");
+      }
+    } else if (!strcmp(sub, "playpwmdac")) {
+      char* fn = nullptr;
+      if (!nextToken(p, fn)) {
+        Console.println("usage: wav playpwmdac <file>");
+        return;
+      }
+      if (!wavPlayPWMDACFile(fn)) {
+        Console.println("wav playpwmdac: failed");
+      }
+    } else {
+      Console.println("usage: wav play <file> | wav playpwm <file> [pin] | wav playpwmdac <file>");
+    }
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
 #ifdef ARDUINO_ARCH_RP2040
@@ -1199,10 +1918,11 @@ static void handleCommand(char* line) {
     if (!strcmp(arg, "enter")) {
       if (!g_isp_active) {
         ArbiterISP::initTestPins();
+        ArbiterISP::cleanupToResetState();
         ArbiterISP::enterISPMode();
         g_isp_active = true;
       }
-      Console.println("ISP: entered");
+      // Do NOT print here; keeps STK stream clean
     } else if (!strcmp(arg, "exit")) {
       if (g_isp_active) {
         ArbiterISP::exitISPMode();
@@ -1215,9 +1935,8 @@ static void handleCommand(char* line) {
     }
   } else if (!strcmp(t0, "dacperf")) {
     Console.println("Running DAC performance test..");
-    extern void performance_test();
     performance_test();
-  } else if (!strcmp(t0, "reset")) {
+  } else if (!strcmp(t0, "reset") || !strcmp(t0, "reboot")) {
     Console.println("Rebooting..");
     delay(20);
     yield();
@@ -1230,6 +1949,12 @@ static void handleConsoleLine(char* line) {
   handleCommand(line);
 }
 static void pumpConsole() {
+  if (g_isp_active) return;  // MUTE console during ISP
+  // prioritize base64 streaming if active
+  if (g_b64u.active) {
+    b64uPump();
+    return;
+  }
   if (!Serial) return;
   while (Serial.available() > 0) {
     int ch = Serial.read();
@@ -1266,11 +1991,11 @@ static void pumpConsole() {
   }
   consolePromptOnce();
 }
-
 // ------- Serial byte helpers -------
 static bool readByte(uint8_t& b, uint32_t timeoutMs) {
   uint32_t start = millis();
   while ((millis() - start) <= timeoutMs) {
+    keypadPollSPI();  // keep keypad alive while we wait
     pumpConsole();
     int a = coproclink.available();
     if (a > 0) {
@@ -1372,8 +2097,7 @@ static const char* cmdName(uint16_t c) {
   return "UNKNOWN";
 }
 // Build response from request (delegates exec/script commands to CoProcExec)
-static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload,
-                           CoProc::Frame& respH, uint8_t* respBuf, uint32_t& respLen) {
+static void processRequest(const CoProc::Frame& hdr, const uint8_t* payload, CoProc::Frame& respH, uint8_t* respBuf, uint32_t& respLen) {
   size_t off = 0;
   int32_t st = CoProc::ST_BAD_CMD;
   respLen = 0;
@@ -1491,6 +2215,7 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
       if ((millis() - lastActivity) > 1000) {
         lastActivity = millis();
       }
+      keypadPollSPI();  // keep keypad alive while we idle
       pumpConsole();
       serviceISPIfActive();
       tight_loop_contents();
@@ -1498,11 +2223,60 @@ static bool readFramedRequest(CoProc::Frame& hdr, uint8_t* payloadBuf) {
     }
   }
 }
+// ===== ISP service loop (keeps STK500 alive and listens for limited RPC to exit) =====
+static void ispServiceLoop() {
+  for (;;) {
+    // Service STK500 byte stream on USB Serial
+    ArbiterISP::serviceISPOnce();
+    // Allow the main-processor to command exit via coproclink RPC.
+    if (coproclink.available() > 0) {
+      if (readFramedRequest(g_reqHdr, g_reqBuf)) {
+        uint16_t cmd = g_reqHdr.cmd;
+        bool allow = (cmd == CoProc::CMD_ISP_EXIT) || (cmd == CoProc::CMD_STATUS) || (cmd == CoProc::CMD_HELLO) || (cmd == CoProc::CMD_INFO);
+        uint32_t respLen = 0;
+        if (allow) {
+          if (cmd == CoProc::CMD_ISP_EXIT) {
+            size_t off = 0;
+            (void)handleISP_EXIT(g_respBuf, RESP_MAX, off);
+            uint32_t crc = CoProc::crc32_ieee(g_respBuf, off);
+            CoProc::makeResponseHeader(g_respHdr, g_reqHdr.cmd, g_reqHdr.seq, (uint32_t)off, crc);
+            writeAll(reinterpret_cast<const uint8_t*>(&g_respHdr), sizeof(CoProc::Frame), 2000);
+            if (off) writeAll(g_respBuf, off, 5000);
+            // Left ISP; return to normal loop
+            return;
+          } else {
+            processRequest(g_reqHdr, g_reqBuf, g_respHdr, g_respBuf, respLen);
+            (void)writeAll(reinterpret_cast<const uint8_t*>(&g_respHdr), sizeof(CoProc::Frame), 2000);
+            if (respLen) (void)writeAll(g_respBuf, respLen, 10000);
+          }
+        } else {
+          // Reject other commands while in ISP
+          size_t off = 0;
+          int32_t st = CoProc::ST_STATE;
+          CoProc::writePOD(g_respBuf, RESP_MAX, off, st);
+          uint32_t crc = CoProc::crc32_ieee(g_respBuf, off);
+          CoProc::makeResponseHeader(g_respHdr, g_reqHdr.cmd, g_reqHdr.seq, (uint32_t)off, crc);
+          (void)writeAll(reinterpret_cast<const uint8_t*>(&g_respHdr), sizeof(CoProc::Frame), 2000);
+          if (off) (void)writeAll(g_respBuf, off, 10000);
+        }
+      }
+    }
+    tight_loop_contents();
+    yield();
+  }
+}
 // ------- Core0: serial protocol loop -------
 static void protocolLoop() {
   for (;;) {
+    if (g_isp_active) {
+      // ISP mode: service STK500 on USB Serial; allow limited RPC to exit ISP.
+      ispServiceLoop();
+      continue;
+    }
     serviceISPIfActive();
     pumpConsole();
+    // Poll 4x4 keypad via MCP23S17 (SPI1)
+    keypadPollSPI();
     if (!readFramedRequest(g_reqHdr, g_reqBuf)) {
       continue;
     }
@@ -1518,6 +2292,8 @@ static void protocolLoop() {
         continue;
       }
     }
+    // Optional second poll
+    keypadPollSPI();
     pumpConsole();
     serviceISPIfActive();
     if (BOOTSEL) {
@@ -1560,37 +2336,6 @@ static int32_t fn_tone(const int32_t* a, uint32_t n) {
   }
   return CoProc::ST_OK;
 }
-#include "MCP_DAC.h"
-//MCP4921 MCP(19, 18);  //  SW SPI
-MCP4921 MCP;  //  HW SPI
-volatile int x;
-uint32_t start, stop;
-void performance_test() {
-  Console.println();
-  Console.println(__FUNCTION__);
-  start = micros();
-  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
-    x = MCP.write(value, 0);
-  }
-  stop = micros();
-  Console.print(MCP.maxValue());
-  Console.print(" x MCP.write():\t");
-  Console.print(stop - start);
-  Console.print("\t");
-  Console.println((stop - start) / (MCP.maxValue() + 1.0));
-  delay(10);
-  start = micros();
-  for (uint16_t value = 0; value < MCP.maxValue(); value++) {
-    MCP.fastWriteA(value);
-  }
-  stop = micros();
-  Console.print(MCP.maxValue());
-  Console.print(" x MCP.fastWriteA():\t");
-  Console.print(stop - start);
-  Console.print("\t");
-  Console.println((stop - start) / (MCP.maxValue() + 1.0));
-  delay(10);
-}
 // ========== Setup and main ==========
 void setup() {
   delay(500);
@@ -1598,15 +2343,14 @@ void setup() {
   if (!Serial) delay(1000);
   delay(5000);
   Serial.println("CoProc (soft-serial) booting...");
-  // Arbiter + CBTLV3257 wiring help (this MCU = Owner B)
-  /*Serial.println("External SPI arbiter wiring (this MCU = Owner B):");
-  ... wiring notes ... */
+  Console.begin();
+  // Arbiter init
   ArbiterISP::initTestPins();
   ArbiterISP::cleanupToResetState();
   // Protocol buffers
   g_reqBuf = (uint8_t*)malloc(REQ_MAX);
   g_respBuf = (uint8_t*)malloc(RESP_MAX);
-  // Software serial coproclink
+  // Software serial link
   coproclink.begin(SOFT_BAUD);
   coproclink.listen();
   // Executor
@@ -1614,12 +2358,10 @@ void setup() {
   g_exec.registerFunc("ping", 0, fn_ping);
   g_exec.registerFunc("add", -1, fn_add);
   g_exec.registerFunc("tone", 3, fn_tone);
-  // Enable arbiter guard (Co-Proc B)
-  //UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5, /*reqActiveLow*/ true, /*grantActiveHigh*/ true, /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
+  // Unified SPI bus and scan (SPI1)
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   uniMem.setCsList({ PIN_PSRAM_CS0 });
-  // Keep slow scan for robustness
   size_t found = uniMem.rescan(50000UL);
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
@@ -1627,13 +2369,20 @@ void setup() {
     if (!di) continue;
     Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
+  // Begin FS facades
+  bool nandOk = fsNAND.begin(uniMem);
+  bool flashOk = fsFlash.begin(uniMem);
   bool psramOk = fsPSRAM.begin(uniMem);
+  if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
+  if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
-  bindActiveFsPSRAM();
-  if (psramOk) {
-    bool m = activeFs.mount(false);
-    Console.println(m ? "PSRAM FS mounted" : "PSRAM FS mount failed");
+  // Bind and mount preferred backend
+  bindActiveFs(g_storage);
+  bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
+  if (!mounted) {
+    Console.println("FS mount failed on active storage");
   }
+  // SPI0 for DAC
   SPI.begin();
   MCP.begin(17);
   Console.print("DAC CHANNELS:\t");
@@ -1641,15 +2390,33 @@ void setup() {
   Console.print("DAC MAXVALUE:\t");
   Console.println(MCP.maxValue());
   performance_test();
+  MCP.fastWriteA(0);
+  if (!Console.tftAttach(&SPI1, 20, 21, -1, 240, 320, /*rotation*/ 1, /*invert*/ false)) {
+    Serial.println("TFT attach (HW) failed");
+  } else {
+    Console.println("TFT attach (HW) succeeded!");
+  }
+  // MCP23S17 on SPI1
+  if (mcpInit()) {
+    Console.println("MCP23S17 ready. GPA7..GPA4 = columns, GPA3..GPA0 = rows.");
+  } else {
+    Console.println("MCP23S17 init failed.");
+  }
   Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
   Console.println("USB console ready. Type 'help' for commands.");
   consolePromptOnce();
 }
 void loop() {
+  // Poll 4x4 keypad via MCP23S17 (SPI1)
+  //keypadPollSPI();
   protocolLoop();
-}  // never returns
+}
 // setup1/loop1 for core1 (Philhower)
-void setup1() { /* nothing */
+void setup1() {
+  if (BOOTSEL) {
+    delay(2000);
+    watchdog_reboot(0, 0, 1500);
+  }
 }
 void loop1() {
   g_exec.workerPoll();
