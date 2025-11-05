@@ -44,6 +44,44 @@
 #include <string.h>
 #include "UnifiedSPIMem.h"
 
+// --------------------------- Debug controls ---------------------------
+// Define these before including this header to customize.
+#ifndef USFS_DEBUG_ENABLE
+#define USFS_DEBUG_ENABLE 1  // 1 = enable debug prints, 0 = disable
+#endif
+#ifndef USFS_DEBUG_YIELD
+#define USFS_DEBUG_YIELD 1  // 1 = periodic yield() in long loops, 0 = no yield()
+#endif
+#ifndef USFS_PROGRESS_STEP_PERCENT
+#define USFS_PROGRESS_STEP_PERCENT 5  // Progress print granularity when streaming large writes
+#endif
+#ifndef USFS_WRITE_CHUNK_BYTES
+#define USFS_WRITE_CHUNK_BYTES (8u * 1024u)  // Chunk size for large initial writes
+#endif
+#ifndef USFS_SCAN_CHUNK_BYTES
+#define USFS_SCAN_CHUNK_BYTES 256u  // Region-is-erased scan chunk
+#endif
+#ifndef USFS_MAX_ERASE_CALL_BYTES
+#define USFS_MAX_ERASE_CALL_BYTES (1u * 1024u * 1024u)  // At most this many bytes per eraseRange() call
+#endif
+
+#if USFS_DEBUG_ENABLE
+#define USFS_DBG_PRINTF(...) \
+  do { Serial.printf(__VA_ARGS__); } while (0)
+#else
+#define USFS_DBG_PRINTF(...) \
+  do { \
+  } while (0)
+#endif
+#if USFS_DEBUG_YIELD
+#define USFS_DBG_YIELD() \
+  do { yield(); } while (0)
+#else
+#define USFS_DBG_YIELD() \
+  do { \
+  } while (0)
+#endif
+
 // -------------------------------------------
 // UnifiedSPIMem driver adapter for SimpleFS
 // -------------------------------------------
@@ -59,6 +97,10 @@ public:
     _dev = dev;
     _type = _dev ? _dev->type() : DeviceType::Unknown;
     _eraseSize = _dev ? _dev->eraseSize() : 0;
+    USFS_DBG_PRINTF("[USFS][Driver] attach dev=%p type=%s eraseSize=%lu pageSize=%lu cap=%llu\n",
+                    (void*)_dev, UnifiedSpiMem::deviceTypeName(_type),
+                    (unsigned long)_eraseSize, (unsigned long)pageSize(),
+                    (unsigned long long)capacityBytes());
   }
   UnifiedSpiMem::MemDevice* device() const {
     return _dev;
@@ -75,27 +117,41 @@ public:
   bool eraseRange(uint64_t addr, uint64_t len) {
     if (!_dev) return false;
     if (_eraseSize == 0) return false;
-    return _dev->eraseRange(addr, len);
+    USFS_DBG_PRINTF("[USFS][Driver] eraseRange addr=0x%08llX len=%llu (esize=%lu)\n",
+                    (unsigned long long)addr, (unsigned long long)len, (unsigned long)_eraseSize);
+    bool ok = _dev->eraseRange(addr, len);
+    USFS_DBG_PRINTF("[USFS][Driver] eraseRange -> %s\n", ok ? "OK" : "FAIL");
+    return ok;
   }
   // SimpleFS expects these methods:
   bool readData03(uint32_t addr, uint8_t* buf, size_t len) {
     if (!_dev || !buf || len == 0) return true;
     size_t r = _dev->read((uint64_t)addr, buf, len);
+    if (r != len) {
+      USFS_DBG_PRINTF("[USFS][Driver] readData03 FAIL addr=0x%08lX len=%lu got=%lu\n",
+                      (unsigned long)addr, (unsigned long)len, (unsigned long)r);
+    }
     return r == len;
   }
   bool writeData02(uint32_t addr, const uint8_t* buf, size_t len, bool /*needsWriteEnable*/ = false) {
     if (!_dev || !buf || len == 0) return true;
+    USFS_DBG_PRINTF("[USFS][Driver] writeData02 addr=0x%08lX len=%lu type=%s\n",
+                    (unsigned long)addr, (unsigned long)len, UnifiedSpiMem::deviceTypeName(_type));
+    bool ok = false;
     switch (_type) {
       case DeviceType::Psram:
-        // No erase required
-        return _dev->write((uint64_t)addr, buf, len);
+        ok = _dev->write((uint64_t)addr, buf, len);
+        break;
       case DeviceType::NorW25Q:
       case DeviceType::SpiNandMX35:
-        return writeWithErasePolicy(addr, buf, len);
+        ok = writeWithErasePolicy(addr, buf, len);
+        break;
       default:
-        // Unknown: best effort raw write
-        return _dev->write((uint64_t)addr, buf, len);
+        ok = _dev->write((uint64_t)addr, buf, len);
+        break;
     }
+    USFS_DBG_PRINTF("[USFS][Driver] writeData02 -> %s\n", ok ? "OK" : "FAIL");
+    return ok;
   }
   const char* styleName() const {
     return UnifiedSpiMem::deviceTypeName(_type);
@@ -123,19 +179,31 @@ private:
   }
   bool regionIsErased(uint32_t addr, size_t len) {
     if (!_dev || len == 0) return true;
-    // Read-chunk scan for any non-0xFF
-    uint8_t tmp[256];
+    USFS_DBG_PRINTF("[USFS][Driver] regionIsErased addr=0x%08lX len=%lu\n",
+                    (unsigned long)addr, (unsigned long)len);
+    uint8_t tmp[USFS_SCAN_CHUNK_BYTES];
     uint64_t pos = addr;
     uint64_t end = (uint64_t)addr + (uint64_t)len;
+    size_t iter = 0;
     while (pos < end) {
       size_t n = (size_t)min<uint64_t>(sizeof(tmp), end - pos);
       size_t r = _dev->read(pos, tmp, n);
-      if (r != n) return false;  // I/O fail treated as non-erased
+      if (r != n) {
+        USFS_DBG_PRINTF("[USFS][Driver] regionIsErased READ FAIL at 0x%08llX n=%lu (got %lu)\n",
+                        (unsigned long long)pos, (unsigned long)n, (unsigned long)r);
+        return false;  // I/O fail treated as non-erased
+      }
       for (size_t i = 0; i < n; ++i) {
-        if (tmp[i] != 0xFF) return false;
+        if (tmp[i] != 0xFF) {
+          USFS_DBG_PRINTF("[USFS][Driver] regionIsErased -> NOT ERASED at 0x%08llX\n",
+                          (unsigned long long)(pos + i));
+          return false;
+        }
       }
       pos += n;
+      if ((++iter & 0x0F) == 0) USFS_DBG_YIELD();
     }
+    USFS_DBG_PRINTF("[USFS][Driver] regionIsErased -> ERASED\n");
     return true;
   }
   bool writeWithErasePolicy(uint32_t addr, const uint8_t* buf, size_t len) {
@@ -144,18 +212,24 @@ private:
       uint64_t start = alignDown((uint64_t)addr, (uint64_t)_eraseSize);
       uint64_t end = alignUp64((uint64_t)addr + (uint64_t)len, (uint64_t)_eraseSize);
       uint64_t elen = (end > start) ? (end - start) : 0;
+      USFS_DBG_PRINTF("[USFS][Driver] writeWithErasePolicy: all-FF -> ERASE start=0x%08llX len=%llu\n",
+                      (unsigned long long)start, (unsigned long long)elen);
       if (elen) {
-        if (!eraseRange(start, elen)) return false;
+        bool ok = eraseRange(start, elen);
+        USFS_DBG_PRINTF("[USFS][Driver] ERASE covering range -> %s\n", ok ? "OK" : "FAIL");
+        if (!ok) return false;
       }
       return true;
     }
     // For non-FF payload:
     const bool inDir = (addr < DATA_START);
+    USFS_DBG_PRINTF("[USFS][Driver] writeWithErasePolicy: inDir=%d addr=0x%08lX len=%lu\n",
+                    (int)inDir, (unsigned long)addr, (unsigned long)len);
     if (_eraseSize > 0) {
       if (inDir) {
         // Directory writes MUST target previously erased (0xFF) space.
-        // Avoid erasing to preserve prior directory entries.
         if (!regionIsErased(addr, len)) {
+          USFS_DBG_PRINTF("[USFS][Driver] DIR NOT ERASED -> FAIL SAFE\n");
           return false;
         }
       } else {
@@ -164,19 +238,25 @@ private:
           uint64_t start = alignDown((uint64_t)addr, (uint64_t)_eraseSize);
           uint64_t end = alignUp64((uint64_t)addr + (uint64_t)len, (uint64_t)_eraseSize);
           uint64_t elen = (end > start) ? (end - start) : 0;
+          USFS_DBG_PRINTF("[USFS][Driver] DATA not erased; erasing cover start=0x%08llX len=%llu\n",
+                          (unsigned long long)start, (unsigned long long)elen);
           if (elen) {
-            if (!eraseRange(start, elen)) return false;
+            if (!eraseRange(start, elen)) {
+              USFS_DBG_PRINTF("[USFS][Driver] eraseRange FAILED\n");
+              return false;
+            }
           }
         }
       }
     }
-    return _dev->write((uint64_t)addr, buf, len);
+    bool ok = _dev->write((uint64_t)addr, buf, len);
+    USFS_DBG_PRINTF("[USFS][Driver] raw write -> %s\n", ok ? "OK" : "FAIL");
+    return ok;
   }
   UnifiedSpiMem::MemDevice* _dev;
   DeviceType _type;
   uint32_t _eraseSize;
 };
-
 // -------------------------------------------
 /* SimpleFS core (generic, header-only)
    NAND-safe:
@@ -235,11 +315,9 @@ public:
     uint32_t maxEnd = DATA_START;
     uint32_t maxSeq = 0;
     bool sawAny = false;
-
     const uint32_t stride = _dirStride;  // 32 for NOR/PSRAM, pageSize for NAND
     const uint32_t entries = DIR_SIZE / stride;
     uint8_t buf[ENTRY_SIZE];
-
     for (uint32_t i = 0; i < entries; ++i) {
       uint32_t addr = DIR_START + i * stride;
       // Only read logical entry header (32 bytes)
@@ -325,6 +403,7 @@ public:
         uint64_t n = (remain >= _eraseAlign) ? _eraseAlign : remain;
         if (!_dev.eraseRange(pos, n)) return false;
         pos += n;
+        USFS_DBG_YIELD();
       }
     } else {
       // PSRAM: write 0xFF
@@ -336,6 +415,7 @@ public:
         uint32_t n = (pos + CHUNK <= _capacity) ? CHUNK : (_capacity - pos);
         if (!_dev.writeData02(pos, tmp, n)) return false;
         pos += n;
+        USFS_DBG_YIELD();
       }
     }
     _fileCount = 0;
@@ -351,15 +431,12 @@ public:
     int idxExisting = findIndexByName(name);
     bool exists = (idxExisting >= 0 && !_files[idxExisting].deleted);
     if (exists && mode == WriteMode::FailIfExists) return false;
-
     uint32_t start = _dataHead;
     if (start < DATA_START) start = DATA_START;
     if (start + size > _capacity) return false;
-
     if (size > 0) {
       if (!_dev.writeData02(start, data, size)) return false;
     }
-
     uint32_t seq = 0;
     if (!appendDirEntry(0x00, name, start, size, seq)) return false;
     upsertFileIndex(name, start, size, false, seq);
@@ -375,44 +452,87 @@ public:
   bool writeFile(const char* name, const uint8_t* data, uint32_t size, ModeT modeOther) {
     return writeFile(name, data, size, (int)modeOther);
   }
+  // createFileSlot with lightweight debug prints and optional yields
   bool createFileSlot(const char* name, uint32_t reserveBytes, const uint8_t* initialData = nullptr, uint32_t initialSize = 0) {
     ensureParams();
-    if (!validName(name)) return false;
-    if (_dirWriteOffset + _dirStride > DIR_SIZE) return false;
-    if (initialSize > reserveBytes) return false;
-    if (exists(name)) return false;
+    USFS_DBG_PRINTF("[USFS] createFileSlot name='%s' reserve=%lu init=%lu (type=%s eraseAlign=%lu dataHead=0x%08lX)\n",
+                    name ? name : "(null)", (unsigned long)reserveBytes, (unsigned long)initialSize,
+                    UnifiedSpiMem::deviceTypeName(_dev.deviceType()),
+                    (unsigned long)_eraseAlign, (unsigned long)_dataHead);
+
+    if (!validName(name)) {
+      USFS_DBG_PRINTF("[USFS] -> invalid name\n");
+      return false;
+    }
+    if (_dirWriteOffset + _dirStride > DIR_SIZE) {
+      USFS_DBG_PRINTF("[USFS] -> DIR full\n");
+      return false;
+    }
+    if (initialSize > reserveBytes) {
+      USFS_DBG_PRINTF("[USFS] -> init > reserve\n");
+      return false;
+    }
+    if (exists(name)) {
+      USFS_DBG_PRINTF("[USFS] -> exists already\n");
+      return false;
+    }
 
     // Align capacity and start to erase alignment if erase is needed
     uint32_t align = (_eraseAlign > 1) ? _eraseAlign : 1u;
     uint32_t cap = alignUp((reserveBytes < 1u ? 1u : reserveBytes), align);
     uint32_t start = alignUp(_dataHead, align);
     if (start < DATA_START) start = DATA_START;
-    if (start + cap > _capacity) return false;
 
-    // Pre-erase/fill with 0xFF
-    if (_eraseAlign > 1) {
-      if (!_dev.eraseRange(start, cap)) return false;
-    } else {
-      // PSRAM fallback
-      const uint32_t PAGE_CHUNK = 256;
-      uint8_t tmp[PAGE_CHUNK];
-      memset(tmp, 0xFF, PAGE_CHUNK);
-      uint32_t p = start;
-      while (p < start + cap) {
-        uint32_t n = min<uint32_t>(PAGE_CHUNK, start + cap - p);
-        if (!_dev.writeData02(p, tmp, n)) return false;
-        p += n;
+    // Capacity check using 64-bit to avoid overflow
+    uint64_t end64 = (uint64_t)start + (uint64_t)cap;
+    if (end64 > (uint64_t)_capacity) {
+      USFS_DBG_PRINTF("[USFS] -> out of capacity: start=0x%08lX cap=%lu capTotal=%lu\n",
+                      (unsigned long)start, (unsigned long)cap, (unsigned long)_capacity);
+      return false;
+    }
+
+    USFS_DBG_PRINTF("[USFS] slot plan: start=0x%08lX cap=%lu align=%lu\n",
+                    (unsigned long)start, (unsigned long)cap, (unsigned long)align);
+
+    // Only write initial data if provided; driver will erase-on-write as needed for DATA region.
+    if (initialSize > 0 && initialData != nullptr) {
+      USFS_DBG_PRINTF("[USFS] writing initial payload: %lu bytes (chunk=%u)\n",
+                      (unsigned long)initialSize, (unsigned)USFS_WRITE_CHUNK_BYTES);
+      uint32_t written = 0;
+      uint8_t lastPct = 255;  // ensure first print
+      uint32_t t0 = millis();
+      while (written < initialSize) {
+        uint32_t n = min<uint32_t>(USFS_WRITE_CHUNK_BYTES, initialSize - written);
+        bool ok = _dev.writeData02(start + written, initialData + written, n);
+        if (!ok) {
+          USFS_DBG_PRINTF("[USFS] initial write FAIL at +%lu (n=%lu)\n",
+                          (unsigned long)written, (unsigned long)n);
+          return false;
+        }
+        written += n;
+        uint8_t pct = (uint8_t)((written * 100u) / (initialSize ? initialSize : 1));
+        if (pct != lastPct && (pct % USFS_PROGRESS_STEP_PERCENT) == 0) {
+          USFS_DBG_PRINTF("[USFS]   progress %u%% (%lu/%lu)\n",
+                          (unsigned)pct, (unsigned long)written, (unsigned long)initialSize);
+          lastPct = pct;
+        }
+        USFS_DBG_YIELD();
       }
+      USFS_DBG_PRINTF("[USFS] initial payload done in %lu ms\n", (unsigned long)(millis() - t0));
     }
 
-    if (initialSize > 0) {
-      if (!_dev.writeData02(start, initialData, initialSize)) return false;
-    }
     uint32_t seq = 0;
-    if (!appendDirEntry(0x00, name, start, initialSize, seq)) return false;
+    if (!appendDirEntry(0x00, name, start, initialSize, seq)) {
+      USFS_DBG_PRINTF("[USFS] appendDirEntry FAIL\n");
+      return false;
+    }
     upsertFileIndex(name, start, initialSize, false, seq);
-    _dataHead = start + cap;
+
+    // Advance head to the end of reserved capacity (logical reservation; physical erase deferred)
+    _dataHead = (uint32_t)end64;
     computeCapacities(_dataHead);
+    USFS_DBG_PRINTF("[USFS] createFileSlot OK: seq=%lu nextHead=0x%08lX\n",
+                    (unsigned long)seq, (unsigned long)_dataHead);
     return true;
   }
   bool writeFileInPlace(const char* name, const uint8_t* data, uint32_t size, bool allowReallocate = false) {
@@ -422,6 +542,8 @@ public:
     FileInfo& fi = _files[idx];
     uint32_t cap = (fi.capEnd > fi.addr) ? (fi.capEnd - fi.addr) : 0;
     if (fi.slotSafe && cap >= size) {
+      USFS_DBG_PRINTF("[USFS] writeFileInPlace name='%s' size=%lu addr=0x%08lX cap=%lu\n",
+                      name, (unsigned long)size, (unsigned long)fi.addr, (unsigned long)cap);
       if (size > 0) {
         if (!_dev.writeData02(fi.addr, data, size)) return false;
       }
@@ -476,6 +598,7 @@ public:
     int idx = findIndexByName(name);
     if (idx < 0 || _files[idx].deleted) return false;
     uint32_t seq = 0;
+    USFS_DBG_PRINTF("[USFS] deleteFile '%s'\n", name);
     if (!appendDirEntry(0x01, name, 0, 0, seq)) return false;
     _files[idx].deleted = true;
     _files[idx].addr = 0;
@@ -568,7 +691,6 @@ private:
   uint32_t _dirWriteOffset;
   uint32_t _dataHead;
   uint32_t _nextSeq;
-
   // Runtime parameters
   bool _paramsInit;
   bool _isNand;
@@ -577,7 +699,6 @@ private:
   uint32_t _dirStride;   // logical stride between entries (32 or NAND page)
   uint8_t* _dirScratch;  // scratch for writing a full NAND page
   uint32_t _lastSeqWritten;
-
   // Utilities
   static inline uint32_t rd32(const uint8_t* p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
@@ -625,6 +746,8 @@ private:
     }
     if (_dirScratch) memset(_dirScratch, 0xFF, _dirStride);
     _paramsInit = true;
+    USFS_DBG_PRINTF("[USFS] ensureParams: isNand=%d eraseAlign=%lu dirStride=%lu\n",
+                    (int)_isNand, (unsigned long)_eraseAlign, (unsigned long)_dirStride);
   }
   int findIndexByName(const char* name) const {
     for (size_t i = 0; i < _fileCount; ++i)
@@ -648,7 +771,6 @@ private:
     outSeq = 0;
     if (!validName(name)) return false;
     if (_dirWriteOffset + _dirStride > DIR_SIZE) return false;
-
     // Prepare logical record (32 bytes)
     uint8_t rec[ENTRY_SIZE];
     memset(rec, 0xFF, ENTRY_SIZE);
@@ -658,15 +780,19 @@ private:
     uint8_t nameLen = (uint8_t)min((size_t)MAX_NAME, strlen(name));
     rec[3] = nameLen;
     for (uint8_t i = 0; i < nameLen; ++i) rec[4 + i] = (uint8_t)name[i];
-
     // Assign sequence and stamp it (increment once on success)
     uint32_t seq = _nextSeq;
     wr32(&rec[20], addr);
     wr32(&rec[24], size);
     wr32(&rec[28], seq);
 
-    bool ok = false;
     const uint32_t dest = DIR_START + _dirWriteOffset;
+    USFS_DBG_PRINTF("[USFS] appendDirEntry flags=0x%02X name='%s' addr=0x%08lX size=%lu seq=%lu dest=0x%08lX stride=%lu (isNand=%d)\n",
+                    flags, name, (unsigned long)addr, (unsigned long)size, (unsigned long)seq,
+                    (unsigned long)dest, (unsigned long)_dirStride, (int)_isNand);
+
+    bool ok = false;
+    uint32_t t0 = millis();
     if (_isNand) {
       // NAND: write one full page with rec at start, rest 0xFF
       memset(_dirScratch, 0xFF, _dirStride);
@@ -678,10 +804,13 @@ private:
       ok = _dev.writeData02(dest, rec, ENTRY_SIZE);
       if (ok) _dirWriteOffset += ENTRY_SIZE;
     }
+    USFS_DBG_PRINTF("[USFS] appendDirEntry -> %s in %lu ms; new dirWriteOffset=0x%08lX\n",
+                    ok ? "OK" : "FAIL", (unsigned long)(millis() - t0), (unsigned long)_dirWriteOffset);
     if (!ok) return false;
     _lastSeqWritten = seq;
     _nextSeq = (_nextSeq == 0xFFFFFFFFu) ? 1u : (_nextSeq + 1u);
     outSeq = _lastSeqWritten;
+    USFS_DBG_YIELD();
     return true;
   }
   void computeCapacities(uint32_t maxEnd) {
@@ -709,7 +838,6 @@ private:
     }
   }
 };
-
 // -------------------------------------------
 // UnifiedSPIMemSimpleFS convenience facade
 // -------------------------------------------
@@ -871,7 +999,6 @@ private:
   UnifiedSimpleFS_Generic<UnifiedMemFSDriver>* _fs;
   uint32_t _capacity32;
 };
-
 // -------------------------------------------
 // Type-specific convenience facades (matching endpoints)
 // -------------------------------------------

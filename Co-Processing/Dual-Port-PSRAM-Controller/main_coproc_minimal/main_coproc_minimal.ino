@@ -8,9 +8,9 @@
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
 #define UNIFIED_SPI_INSTANCE SPI1
-#define UNIFIED_SPI_CLOCK_HZ 10400000UL  // 104 MHz SPI
-#define W25Q_SPI_CLOCK_HZ 10400000UL     // 104 MHz NOR
-#define MX35_SPI_CLOCK_HZ 10400000UL     // 104 MHz NAND
+#define UNIFIED_SPI_CLOCK_HZ 104000000UL  // 104 MHz SPI
+#define W25Q_SPI_CLOCK_HZ 104000000UL     // 104 MHz NOR
+#define MX35_SPI_CLOCK_HZ 104000000UL     // 104 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
 #include "BusArbiterWithISP.h"
 #include "rp_selfupdate.h"
@@ -45,6 +45,7 @@ static const uint8_t PWM_AUDIO_PIN = 3;  // GP3 default; adjust if needed
 #define SOFT_BAUD 115200
 #endif
 static SoftwareSerial coproclink(PIN_RX, PIN_TX, false);  // RX, TX, non-inverted
+static SoftwareSerial auxlink(8, 9, false);               // RX, TX, non-inverted
 struct WavInfo {
   uint32_t dataOffset = 0;
   uint32_t dataSize = 0;
@@ -418,8 +419,8 @@ static const uint8_t PIN_MCP23S17_CS = 6;  // GP6 CS for MCP23S17 on SPI1
 static Adafruit_MCP23X17 mcp;
 // Map keypad to MCP23S17 pins (0..7 = GPA0..GPA7)
 // Wiring: keypad pins 1..8 = C1,C2,C3,C4,R1,R2,R3,R4 connected to GPA7..GPA0
-static const uint8_t COLS[4] = { 4, 5, 6, 7 };  // GPA7..GPA4 (columns we drive)
-static const uint8_t ROWS[4] = { 0, 1, 2, 3 };  // GPA3..GPA0 (rows we read)
+static const uint8_t COLS[4] = { 7, 6, 5, 4 };  // GPA7..GPA4 (columns we drive)
+static const uint8_t ROWS[4] = { 3, 2, 1, 0 };  // GPA3..GPA0 (rows we read)
 // Debounce state
 static uint16_t g_maskStable = 0;
 static uint16_t g_maskPrev = 0;
@@ -472,24 +473,31 @@ static uint16_t mcpScanMatrix16() {
   uint16_t mask = 0;
   for (uint8_t c = 0; c < 4; ++c) {
     // Tri-state all columns
-    for (uint8_t i = 0; i < 4; ++i) {
-      mcp.pinMode(COLS[i], INPUT);
-    }
+    for (uint8_t i = 0; i < 4; ++i) mcp.pinMode(COLS[i], INPUT);
+
     // Drive this column low
     mcp.pinMode(COLS[c], OUTPUT);
     mcp.digitalWrite(COLS[c], LOW);
-    delayMicroseconds(30);  // settle
-    // Read both banks and grab A-port (lower 8 bits)
+    delayMicroseconds(30);
+
     uint16_t ab = mcp.readGPIOAB();
     uint8_t porta = (uint8_t)(ab & 0xFF);
-    // Rows are on GPA0..GPA3 -> take low nibble, invert (pull-ups)
+
+    // Active-low rows on GPA0..GPA3
     uint8_t rows = (uint8_t)((~porta) & 0x0F);
+
+    // Reverse the nibble so bit0=top row (R1/GPA3), bit3=bottom row (R4/GPA0)
+    rows = ((rows & 0x1) << 3) |  // A0 -> bit3
+           ((rows & 0x2) << 1) |  // A1 -> bit2
+           ((rows & 0x4) >> 1) |  // A2 -> bit1
+           ((rows & 0x8) >> 3);   // A3 -> bit0
+
     mask |= (uint16_t)rows << (c * 4);
   }
+
   // Idle: tri-state columns
-  for (uint8_t i = 0; i < 4; ++i) {
-    mcp.pinMode(COLS[i], INPUT);
-  }
+  for (uint8_t i = 0; i < 4; ++i) mcp.pinMode(COLS[i], INPUT);
+
   return mask;
 }
 static void keypadPollSPI() {
@@ -2005,6 +2013,12 @@ static bool readByte(uint8_t& b, uint32_t timeoutMs) {
         return true;
       }
     }
+    if (auxlink.available() > 0) {
+      char v = auxlink.read();
+      if (v >= 0) {
+        Serial.print(v);
+      }
+    }
     serviceISPIfActive();
     tight_loop_contents();
     yield();
@@ -2391,7 +2405,7 @@ void setup() {
   Console.println(MCP.maxValue());
   performance_test();
   MCP.fastWriteA(0);
-  if (!Console.tftAttach(&SPI1, 20, 21, -1, 240, 320, /*rotation*/ 1, /*invert*/ false)) {
+  if (!Console.tftAttach(&SPI1, 20, 21, -1, 240, 320)) {
     Serial.println("TFT attach (HW) failed");
   } else {
     Console.println("TFT attach (HW) succeeded!");
@@ -2403,6 +2417,7 @@ void setup() {
     Console.println("MCP23S17 init failed.");
   }
   Serial.printf("CoProc ready (soft-serial %u bps). RX=GP%u TX=GP%u\n", (unsigned)SOFT_BAUD, (unsigned)PIN_RX, (unsigned)PIN_TX);
+  //auxlink.begin(4800);
   Console.println("USB console ready. Type 'help' for commands.");
   consolePromptOnce();
 }
