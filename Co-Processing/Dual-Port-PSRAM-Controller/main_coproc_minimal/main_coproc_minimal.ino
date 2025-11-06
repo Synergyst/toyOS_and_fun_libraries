@@ -2,6 +2,7 @@
   main_coproc_softserial.ino
   RP2350 / RP2040 Co-Processor (software-serial "bitbanged UART") - transport + blob executor + script interpreter
 */
+#define COPROCLANG_COPY_INPUT 1
 #include <Arduino.h>
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #define CONSOLE_TFT_ENABLE

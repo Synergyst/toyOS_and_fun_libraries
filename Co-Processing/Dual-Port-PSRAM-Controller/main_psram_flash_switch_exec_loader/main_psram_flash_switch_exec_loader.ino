@@ -1,4 +1,5 @@
 // main_psram_flash_switch_exec_loader.ino
+#define COPROCLANG_COPY_INPUT 1
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 // Force low identification speed compatible with the bridge
@@ -80,7 +81,7 @@ enum class StorageBackend {
   PSRAM_BACKEND,
   NAND,
 };
-static StorageBackend g_storage = StorageBackend::NAND;
+static StorageBackend g_storage = StorageBackend::PSRAM_BACKEND;
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
@@ -1826,10 +1827,11 @@ void setup() {
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   //uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
-  uniMem.setCsList({ PIN_NAND_CS });
+  //uniMem.setCsList({ PIN_NAND_CS });
+  uniMem.setCsList({ PIN_NAND_CS, PIN_PSRAM_CS0, PIN_PSRAM_CS1 });
 
   // Keep slow scan for robustness
-  size_t found = uniMem.rescan(50000UL);
+  size_t found = uniMem.rescan(5000UL);
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
   for (size_t i = 0; i < uniMem.detectedCount(); ++i) {
     const auto* di = uniMem.detectedInfo(i);
@@ -1845,7 +1847,7 @@ void setup() {
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
 
   bindActiveFs(g_storage);
-  bool mounted = activeFs.mount(g_storage == StorageBackend::NAND /*autoFormatIfEmpty*/);
+  bool mounted = activeFs.mount(g_storage == StorageBackend::PSRAM_BACKEND /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
