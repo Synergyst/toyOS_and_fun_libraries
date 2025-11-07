@@ -1,22 +1,17 @@
 // main_mcu.ino - Running on WaveShare RP2040-Zero
 #define COPROCLANG_COPY_INPUT 1
-
-// ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 static ConsolePrint Console;  // Console wrapper
-
+// ------- Shared HW SPI (FLASH + PSRAM + NAND) -------
 // Force low identification speed compatible with the bridge
 //#define UNIFIED_SPI_INSTANCE SPI1
 #define UNIFIED_SPI_INSTANCE SPI
 #define UNIFIED_SPI_CLOCK_HZ 104000000UL  // 104 MHz SPI
 #define W25Q_SPI_CLOCK_HZ 104000000UL     // 104 MHz NOR
 #define MX35_SPI_CLOCK_HZ 104000000UL     // 104 MHz NAND
-
 #include "UnifiedSPIMemSimpleFS.h"
-
 // ------- Custom scripting language interpreter -------
 #include "LangInter.h"
-
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -24,12 +19,8 @@ static ConsolePrint Console;  // Console wrapper
   const uint8_t* name = reinterpret_cast<const uint8_t*>(name##_ascii); \
   const unsigned int name##_len = (unsigned int)(sizeof(name##_ascii) - 1)
 #endif
-
 struct BlobReg;  // Forward declaration
-
-// ------- MC Compiiler -------
 #include "MCCompiler.h"
-
 // ------- User preference configuration -------
 #include "blob_dont.h"
 #define FILE_DONT "dont"
@@ -40,14 +31,17 @@ struct BlobReg;  // Forward declaration
 #define FILE_PT1 "pt1"
 #define FILE_PT2 "pt2"
 #define FILE_PT3 "pt3"
-
-#include <SPI.h>
-
-#include "MCP_DAC.h"  // Only if you will use MCP4921 DAC output
+#include "shsha256.h"
+#include "shb64.h"
+static shb64s::State g_b64;
+#include "shfs.h"
+#include "shline.h"
+static shline::State g_le;
+#include "shdiag.h"
 #include "AudioWavOut.h"
 #include "MidiPlayer.h"
 static AudioWavOut Audio;
-static MCP4921 MCP;  // for MCP4921 DAC output
+static MCP4921 MCP;
 static MidiPlayer MIDI;
 
 // ---- MIDI debug defaults (affect 'midi play' commands) ----
@@ -58,31 +52,16 @@ static uint16_t g_midi_prog_ms = 250;                             // progress in
 static int g_midi_track_index = -1;                               // -1 = auto-select by most NoteOn
 static bool g_midi_allow_q = true;                                // allow 'q' to stop playback
 
-#include "shsha256.h"
-#include "shb64.h"
-static shb64s::State g_b64;  // not shb64::State
-
-#include "shfs.h"
-#include "shline.h"
-static shline::State g_le;
-
-// ========== Static buffer-related compile-time constant ==========
-#define FS_SECTOR_SIZE 4096
-
 // ========== Pins for Memory Chips ==========
 const uint8_t PIN_FLASH_MISO = 4;               // GP4
-const uint8_t PIN_PSRAM_MISO = PIN_FLASH_MISO;  // GP4
+const uint8_t PIN_PSRAM_MISO = PIN_FLASH_MISO;  //
 const uint8_t PIN_FLASH_MOSI = 3;               // GP3
-const uint8_t PIN_PSRAM_MOSI = PIN_FLASH_MOSI;  // GP3
+const uint8_t PIN_PSRAM_MOSI = PIN_FLASH_MOSI;  //
 const uint8_t PIN_FLASH_SCK = 6;                // GP6
-const uint8_t PIN_PSRAM_SCK = PIN_FLASH_SCK;    // GP6
-const uint8_t PIN_FLASH_CS0 = 5;                // GP
+const uint8_t PIN_PSRAM_SCK = PIN_FLASH_SCK;    //
+const uint8_t PIN_FLASH_CS0 = 5;                // GP5
 const uint8_t PIN_PSRAM_CS0 = 14;               // GP14
-const uint8_t PIN_PSRAM_CS1 = 15;               // GP15
-const uint8_t PIN_PSRAM_CS2 = 26;               // GP26
-const uint8_t PIN_PSRAM_CS3 = 27;               // GP27
-const uint8_t PIN_NAND_CS = 8;                  // GP5
-const uint8_t PIN_FLASH_CS1 = 29;               // GP29
+const uint8_t PIN_NAND_CS = 8;                  // GP8
 
 // Audio/MCP pins
 static const uint8_t PIN_DAC_CS = 7;   // MCP4921 CS on GP7
@@ -98,7 +77,6 @@ UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  /
 W25QUnifiedSimpleFS fsFlash;
 PSRAMUnifiedSimpleFS fsPSRAM;
 MX35UnifiedSimpleFS fsNAND;
-
 static bool g_dev_mode = true;
 
 // ---- MIDI CLI helpers ----
@@ -176,51 +154,6 @@ static const BlobReg g_blobs[] = {
   { FILE_PT3, blob_pt3, blob_pt3_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-
-// ================= Memory Diagnostics =================
-#ifdef ARDUINO_ARCH_RP2040
-extern "C" {
-  extern char __StackTop;
-  extern char __StackBottom;
-}
-#include "unistd.h"
-static uint32_t freeStackCurrentCoreApprox() {
-  volatile uint8_t marker;
-  uintptr_t sp = (uintptr_t)&marker;
-  uintptr_t top = (uintptr_t)&__StackTop;
-  uintptr_t bottom = (uintptr_t)&__StackBottom;
-  if (top > bottom && sp >= bottom && sp <= top) {
-    return (uint32_t)(sp - bottom);
-  }
-  void* heapEnd = sbrk(0);
-  intptr_t gap = (intptr_t)sp - (intptr_t)heapEnd;
-  return (gap > 0) ? (uint32_t)gap : 0u;
-}
-#else
-static uint32_t freeStackCurrentCoreApprox() {
-  volatile uint8_t marker;
-  void* heapEnd = sbrk(0);
-  intptr_t gap = (intptr_t)&marker - (intptr_t)heapEnd;
-  return (gap > 0) ? (uint32_t)gap : 0u;
-}
-#endif
-
-#ifdef ARDUINO_ARCH_RP2040
-static void printStackInfo() {
-  volatile uint8_t marker;
-  uintptr_t sp = (uintptr_t)&marker;
-  uintptr_t top = (uintptr_t)&__StackTop;
-  uintptr_t bottom = (uintptr_t)&__StackBottom;
-  if (top > bottom && sp >= bottom && sp <= top) {
-    uint32_t total = (uint32_t)(top - bottom);
-    uint32_t used = (uint32_t)(top - sp);
-    uint32_t free = (uint32_t)(sp - bottom);
-    Console.printf("Stack total=%u used=%u free=%u bytes\n", total, used, free);
-    return;
-  }
-  Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
-}
-#endif
 
 // ========== FS helpers and console ==========
 static bool checkNameLen(const char* name) {
@@ -367,169 +300,6 @@ static void autogenBlobWrites() {
   allOk &= ensureBlobIfMissing(FILE_PT3, blob_pt3, blob_pt3_len);
   Console.print("Autogen:  ");
   Console.println(allOk ? "OK" : "some failures");
-}
-
-// ========== PSRAM diagnostics using UnifiedSPIMem ==========
-static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = Serial) {
-  size_t banks = 0;
-  uint64_t total = 0;
-  out.println();
-  out.println("PSRAM capacity report (Unified):");
-  for (size_t i = 0; i < mgr.detectedCount(); ++i) {
-    const auto* di = mgr.detectedInfo(i);
-    if (!di || di->type != UnifiedSpiMem::DeviceType::Psram) continue;
-    banks++;
-    total += di->capacityBytes;
-    out.print("  Bank ");
-    out.print(banks - 1);
-    out.print(" (CS=");
-    out.print(di->cs);
-    out.print(")  Vendor=");
-    out.print(di->vendorName);
-    out.print("  Cap=");
-    out.print((unsigned long)di->capacityBytes);
-    out.print(" bytes");
-    if (di->partHint) {
-      out.print("  Part=");
-      out.print(di->partHint);
-    }
-    out.print("  JEDEC:");
-    for (uint8_t k = 0; k < di->jedecLen; ++k) {
-      out.print(' ');
-      if (di->jedec[k] < 16) out.print('0');
-      out.print(di->jedec[k], HEX);
-    }
-    out.println();
-  }
-  out.print("Banks: ");
-  out.println((unsigned)banks);
-  out.print("Total: ");
-  out.print((unsigned long)total);
-  out.print(" bytes (");
-  out.print((unsigned long)(total / (1024UL * 1024UL)));
-  out.println(" MB)");
-  out.println();
-}
-
-static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
-  auto* dev = fs.raw().device();
-  if (!dev || dev->type() != UnifiedSpiMem::DeviceType::Psram) {
-    out.println("PSRAM smoke test: PSRAM device not open");
-    return;
-  }
-  const uint64_t cap = dev->capacity();
-  if (cap < 1024) {
-    out.println("PSRAM smoke test: capacity too small");
-    return;
-  }
-  const uint32_t fsHead = fs.raw().nextDataAddr();
-  const uint32_t dataStart = fs.raw().dataRegionStart();
-  const uint32_t TEST_SIZE = 1024;
-
-  uint64_t testAddr = fsHead + 4096;
-  if (testAddr + TEST_SIZE > cap) {
-    if (cap > TEST_SIZE) testAddr = cap - TEST_SIZE;
-    else testAddr = 0;
-  }
-  testAddr = (testAddr + 0xFF) & ~0xFFull;
-  if (testAddr < dataStart) testAddr = dataStart;
-
-  out.print("PSRAM smoke test @ 0x");
-  out.print((unsigned long)testAddr, HEX);
-  out.print(" size=");
-  out.print(TEST_SIZE);
-  out.println(" bytes");
-
-  uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
-  uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
-  if (!original || !verify) {
-    out.println("malloc failed for buffers");
-    if (original) free(original);
-    if (verify) free(verify);
-    return;
-  }
-
-  if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
-    out.println("read (backup) failed");
-    free(original);
-    free(verify);
-    return;
-  }
-
-  memset(verify, 0xAA, TEST_SIZE);
-  if (!dev->write(testAddr, verify, TEST_SIZE)) {
-    out.println("write pattern 0xAA failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-
-  memset(verify, 0x00, TEST_SIZE);
-  if (dev->read(testAddr, verify, TEST_SIZE) != TEST_SIZE) {
-    out.println("readback (0xAA) failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  bool okAA = true;
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    if (verify[i] != 0xAA) {
-      okAA = false;
-      break;
-    }
-    if ((i & 63) == 0) yield();
-  }
-  out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
-
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
-  }
-  if (!dev->write(testAddr, verify, TEST_SIZE)) {
-    out.println("write pattern addr^0x5A failed");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-
-  uint8_t* rb = (uint8_t*)malloc(TEST_SIZE);
-  if (!rb) {
-    out.println("malloc failed for readback");
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  if (dev->read(testAddr, rb, TEST_SIZE) != TEST_SIZE) {
-    out.println("readback (addr^0x5A) failed");
-    free(rb);
-    (void)dev->write(testAddr, original, TEST_SIZE);
-    free(original);
-    free(verify);
-    return;
-  }
-  bool okAddr = true;
-  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
-    uint8_t exp = (uint8_t)((testAddr + i) ^ 0x5A);
-    if (rb[i] != exp) {
-      okAddr = false;
-      break;
-    }
-    if ((i & 63) == 0) yield();
-  }
-  out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
-
-  free(rb);
-
-  if (!dev->write(testAddr, original, TEST_SIZE)) {
-    out.println("restore failed (data left with test pattern)");
-  } else {
-    out.println("restore OK");
-  }
-  free(original);
-  free(verify);
 }
 
 static inline int hexVal(char c) {
@@ -1186,16 +956,12 @@ static void handleCommand(char* line) {
     Console.printf("Total PSRAM Heap:  %d bytes\n", rp2040.getTotalPSRAMHeap());
     Console.printf("Free PSRAM Heap:   %d bytes\n", rp2040.getFreePSRAMHeap());
     Console.printf("Used PSRAM Heap:   %d bytes\n", rp2040.getUsedPSRAMHeap());
-#ifdef ARDUINO_ARCH_RP2040
-    printStackInfo();
-#else
-    Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
-#endif
-    psramPrintCapacityReport(uniMem);
+    shdiag::Diag::printStackInfo(Console);  // or Serial
+    shdiag::Diag::psramPrintCapacityReport(uniMem, Console);
 
   } else if (!strcmp(t0, "psramsmoketest")) {
-    psramPrintCapacityReport(uniMem);
-    psramSafeSmokeTest(fsPSRAM);
+    shdiag::Diag::psramPrintCapacityReport(uniMem, Console);
+    shdiag::Diag::psramSafeSmokeTest(fsPSRAM, Console);
 
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
@@ -1948,6 +1714,7 @@ void setup() {
   Audio.attachMCP4921(&MCP);
   MIDI.attachMCP4921(&MCP);
 
+  Console.print("Testing for Arduino IDE terminal (ignore artifacts)..");
   // Line editor: Basic by default (Arduino Serial Monitor)
   shline::begin(g_le, Serial, "> ");
   // Option A: manual selection (recommended), no ANSI
@@ -1955,6 +1722,7 @@ void setup() {
   // Option B: try auto-probe and fall back
   if (shline::probeAnsiSupport(g_le)) shline::setMode(g_le, shline::Mode::Advanced);
   else shline::setMode(g_le, shline::Mode::Basic);
+  Console.println(" done");
 
   Console.printf("System ready. Type 'help'\n");
   shline::printPrompt(g_le);
