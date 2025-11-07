@@ -1,17 +1,22 @@
 // main_mcu.ino - Running on WaveShare RP2040-Zero
 #define COPROCLANG_COPY_INPUT 1
+
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
 static ConsolePrint Console;  // Console wrapper
+
 // Force low identification speed compatible with the bridge
 //#define UNIFIED_SPI_INSTANCE SPI1
 #define UNIFIED_SPI_INSTANCE SPI
 #define UNIFIED_SPI_CLOCK_HZ 104000000UL  // 104 MHz SPI
 #define W25Q_SPI_CLOCK_HZ 104000000UL     // 104 MHz NOR
 #define MX35_SPI_CLOCK_HZ 104000000UL     // 104 MHz NAND
+
 #include "UnifiedSPIMemSimpleFS.h"
+
 // ------- Custom scripting language interpreter -------
 #include "LangInter.h"
+
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -19,9 +24,12 @@ static ConsolePrint Console;  // Console wrapper
   const uint8_t* name = reinterpret_cast<const uint8_t*>(name##_ascii); \
   const unsigned int name##_len = (unsigned int)(sizeof(name##_ascii) - 1)
 #endif
+
 struct BlobReg;  // Forward declaration
+
 // ------- MC Compiiler -------
 #include "MCCompiler.h"
+
 // ------- User preference configuration -------
 #include "blob_dont.h"
 #define FILE_DONT "dont"
@@ -32,13 +40,16 @@ struct BlobReg;  // Forward declaration
 #define FILE_PT1 "pt1"
 #define FILE_PT2 "pt2"
 #define FILE_PT3 "pt3"
+
 #include <SPI.h>
+
 #include "MCP_DAC.h"  // Only if you will use MCP4921 DAC output
 #include "AudioWavOut.h"
 #include "MidiPlayer.h"
 static AudioWavOut Audio;
 static MCP4921 MCP;  // for MCP4921 DAC output
 static MidiPlayer MIDI;
+
 // ---- MIDI debug defaults (affect 'midi play' commands) ----
 // Requires MidiPlayer.h updated with Debug enum and progress fields.
 static MidiPlayer::Debug g_midi_debug = MidiPlayer::Debug::Info;  // Off|Errors|Info|Verbose
@@ -50,10 +61,14 @@ static bool g_midi_allow_q = true;                                // allow 'q' t
 #include "shsha256.h"
 #include "shb64.h"
 static shb64s::State g_b64;  // not shb64::State
+
 #include "shfs.h"
+#include "shline.h"
+static shline::State g_le;
 
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
+
 // ========== Pins for Memory Chips ==========
 const uint8_t PIN_FLASH_MISO = 4;               // GP4
 const uint8_t PIN_PSRAM_MISO = PIN_FLASH_MISO;  // GP4
@@ -68,64 +83,23 @@ const uint8_t PIN_PSRAM_CS2 = 26;               // GP26
 const uint8_t PIN_PSRAM_CS3 = 27;               // GP27
 const uint8_t PIN_NAND_CS = 8;                  // GP5
 const uint8_t PIN_FLASH_CS1 = 29;               // GP29
+
 // Audio/MCP pins
 static const uint8_t PIN_DAC_CS = 7;   // MCP4921 CS on GP7
 static const uint8_t PIN_BUZZER = 29;  // Buzzer/PWM on GP29
+
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
+
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
+
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
 PSRAMUnifiedSimpleFS fsPSRAM;
 MX35UnifiedSimpleFS fsNAND;
+
 static bool g_dev_mode = true;
-struct SHA256_CTX {
-  uint32_t state[8];
-  uint64_t bitlen;
-  uint8_t data[64];
-  uint32_t datalen;
-};
-// Helper to get device for specific backend (used by fscp)
-static inline UnifiedSpiMem::MemDevice* deviceForBackend(StorageBackend backend) {
-  switch (backend) {
-    case StorageBackend::Flash: return fsFlash.raw().device();
-    case StorageBackend::PSRAM_BACKEND: return fsPSRAM.raw().device();
-    case StorageBackend::NAND: return fsNAND.raw().device();
-    default: return nullptr;
-  }
-}
-static bool writeFileToFolder(const char* folder, const char* fname, const uint8_t* data, uint32_t len) {
-  char path[ActiveFS::MAX_NAME + 1];
-  if (!makePathSafe(path, sizeof(path), folder, fname)) {
-    Console.println("path too long for SimpleFS (max 32 chars)");
-    return false;
-  }
-  uint32_t eraseAlign = getEraseAlign();
-  if (!activeFs.exists(path)) {
-    uint32_t reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : eraseAlign);
-    if (reserve < eraseAlign) reserve = eraseAlign;
-    return activeFs.createFileSlot(path, reserve, data, len);
-  }
-  if (activeFs.writeFileInPlace(path, data, len, true)) return true;
-  return activeFs.writeFile(path, data, len, fsReplaceMode());
-}
-static uint32_t readFileFromFolder(const char* folder, const char* fname, uint8_t* buf, uint32_t bufSize) {
-  char path[ActiveFS::MAX_NAME + 1];
-  if (!makePathSafe(path, sizeof(path), folder, fname)) {
-    Console.println("path too long for SimpleFS (max 32 chars)");
-    return 0;
-  }
-  return activeFs.readFile(path, buf, bufSize);
-}
-static void printPct2(uint32_t num, uint32_t den) {
-  if (den == 0) {
-    Console.print("n/a");
-    return;
-  }
-  uint32_t scaled = (uint32_t)(((uint64_t)num * 10000ULL + (den / 2)) / den);
-  Console.printf("%lu.%02lu%%", (unsigned long)(scaled / 100), (unsigned long)(scaled % 100));
-}
 
 // ---- MIDI CLI helpers ----
 static bool eqNoCase(const char* a, const char* b) {
@@ -140,6 +114,7 @@ static bool eqNoCase(const char* a, const char* b) {
   }
   return *a == 0 && *b == 0;
 }
+
 static bool parseMidiDebug(const char* s, MidiPlayer::Debug& lvl) {
   if (!s) return false;
   if (eqNoCase(s, "off")) {
@@ -160,6 +135,7 @@ static bool parseMidiDebug(const char* s, MidiPlayer::Debug& lvl) {
   }
   return false;
 }
+
 static bool parseOnOff(const char* s, bool& v) {
   if (!s) return false;
   if (eqNoCase(s, "on") || eqNoCase(s, "1") || eqNoCase(s, "true")) {
@@ -172,6 +148,7 @@ static bool parseOnOff(const char* s, bool& v) {
   }
   return false;
 }
+
 static const char* midiDebugName(MidiPlayer::Debug d) {
   switch (d) {
     case MidiPlayer::Debug::Off: return "off";
@@ -188,6 +165,7 @@ struct BlobReg {
   const uint8_t* data;
   unsigned int len;
 };
+
 static const BlobReg g_blobs[] = {
   { FILE_DONT, blob_dont, blob_dont_len },
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
@@ -226,6 +204,7 @@ static uint32_t freeStackCurrentCoreApprox() {
   return (gap > 0) ? (uint32_t)gap : 0u;
 }
 #endif
+
 #ifdef ARDUINO_ARCH_RP2040
 static void printStackInfo() {
   volatile uint8_t marker;
@@ -256,17 +235,20 @@ static bool checkNameLen(const char* name) {
   }
   return true;
 }
+
 static void listBlobs() {
   Console.println("Available blobs:");
   for (size_t i = 0; i < g_blobs_count; ++i) {
     Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
   }
 }
+
 static const BlobReg* findBlob(const char* id) {
   for (size_t i = 0; i < g_blobs_count; ++i)
     if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
   return nullptr;
 }
+
 static void dumpFileHead(const char* fname, uint32_t count) {
   uint32_t sz = 0;
   if (!activeFs.getFileSize(fname, sz) || sz == 0) {
@@ -297,6 +279,7 @@ static void dumpFileHead(const char* fname, uint32_t count) {
     off += n;
   }
 }
+
 static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   uint32_t eraseAlign = getEraseAlign();
@@ -354,6 +337,7 @@ static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len,
   Console.println("Failed to update file");
   return false;
 }
+
 static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
   if (!checkNameLen(fname)) return false;
   if (activeFs.exists(fname)) {
@@ -371,6 +355,7 @@ static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t
   Console.println("Auto-create failed");
   return false;
 }
+
 static void autogenBlobWrites() {
   bool allOk = true;
   allOk &= ensureBlobIfMissing(FILE_DONT, blob_dont, blob_dont_len);
@@ -425,6 +410,7 @@ static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = 
   out.println(" MB)");
   out.println();
 }
+
 static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   auto* dev = fs.raw().device();
   if (!dev || dev->type() != UnifiedSpiMem::DeviceType::Psram) {
@@ -439,6 +425,7 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   const uint32_t fsHead = fs.raw().nextDataAddr();
   const uint32_t dataStart = fs.raw().dataRegionStart();
   const uint32_t TEST_SIZE = 1024;
+
   uint64_t testAddr = fsHead + 4096;
   if (testAddr + TEST_SIZE > cap) {
     if (cap > TEST_SIZE) testAddr = cap - TEST_SIZE;
@@ -446,11 +433,13 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   }
   testAddr = (testAddr + 0xFF) & ~0xFFull;
   if (testAddr < dataStart) testAddr = dataStart;
+
   out.print("PSRAM smoke test @ 0x");
   out.print((unsigned long)testAddr, HEX);
   out.print(" size=");
   out.print(TEST_SIZE);
   out.println(" bytes");
+
   uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
   uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
   if (!original || !verify) {
@@ -459,12 +448,14 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     if (verify) free(verify);
     return;
   }
+
   if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
     out.println("read (backup) failed");
     free(original);
     free(verify);
     return;
   }
+
   memset(verify, 0xAA, TEST_SIZE);
   if (!dev->write(testAddr, verify, TEST_SIZE)) {
     out.println("write pattern 0xAA failed");
@@ -473,6 +464,7 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     free(verify);
     return;
   }
+
   memset(verify, 0x00, TEST_SIZE);
   if (dev->read(testAddr, verify, TEST_SIZE) != TEST_SIZE) {
     out.println("readback (0xAA) failed");
@@ -490,6 +482,7 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     if ((i & 63) == 0) yield();
   }
   out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
+
   for (uint32_t i = 0; i < TEST_SIZE; ++i) {
     verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
   }
@@ -500,6 +493,7 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     free(verify);
     return;
   }
+
   uint8_t* rb = (uint8_t*)malloc(TEST_SIZE);
   if (!rb) {
     out.println("malloc failed for readback");
@@ -526,7 +520,9 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
     if ((i & 63) == 0) yield();
   }
   out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
+
   free(rb);
+
   if (!dev->write(testAddr, original, TEST_SIZE)) {
     out.println("restore failed (data left with test pattern)");
   } else {
@@ -542,6 +538,7 @@ static inline int hexVal(char c) {
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
 }
+
 static void printHexLower(const uint8_t* d, size_t n) {
   static const char* hexd = "0123456789abcdef";
   for (size_t i = 0; i < n; ++i) {
@@ -549,6 +546,7 @@ static void printHexLower(const uint8_t* d, size_t n) {
     Serial.write(hexd[d[i] & 0xF]);
   }
 }
+
 static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -579,6 +577,7 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   outLen = bytes;
   return true;
 }
+
 static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
@@ -592,6 +591,7 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
     Console.println("putb64: malloc failed");
     return false;
   }
+
   uint32_t o = 0;
   int vals[4];
   int vCount = 0;
@@ -644,11 +644,13 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   outLen = o;
   return true;
 }
+
 static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
   if (!checkNameLen(fname)) return false;
   bool ok = activeFs.writeFile(fname, data, len, fsReplaceMode());
   return ok;
 }
+
 static bool sha256File(const char* fname, uint8_t out[32]) {
   uint32_t sz = 0;
   if (!activeFs.getFileSize(fname, sz)) {
@@ -675,344 +677,6 @@ static bool sha256File(const char* fname, uint8_t out[32]) {
   return true;
 }
 
-// ================== Improved Console Line Editing with History (single-row, horizontal scroll) ==================
-static const char* PROMPT = "> ";
-static char lineBuf[FS_SECTOR_SIZE];  // Input buffer (keep the existing large buffer, but we cap usable length to history capacity)
-// History (SRAM only)
-#define HISTORY_MAX 16
-#define HISTORY_ENTRY_MAX 192
-static char g_history[HISTORY_MAX][HISTORY_ENTRY_MAX];
-static int g_history_count = 0;                        // number of valid entries
-static int g_history_browse = -1;                      // -1 = not browsing; 0 = newest; increases as we go up
-static char g_saved_before_browse[HISTORY_ENTRY_MAX];  // buffer to restore when exiting browse
-static size_t g_saved_before_browse_len = 0;
-// Terminal width handling and single-line viewport
-static size_t g_term_cols = 80;  // default, configurable via 'termwidth' command
-static size_t g_view_start = 0;  // first byte index in lineBuf that is visible
-// Renderer/editor state
-static size_t g_line_len = 0;
-static size_t g_cursor = 0;
-static size_t g_last_render_len = 0;
-static inline size_t promptLen() {
-  return strlen(PROMPT);
-}
-static inline size_t maxLineLen() {
-  return sizeof(lineBuf) - 1;  // 4095 with your FS_SECTOR_SIZE=4096
-}
-static inline size_t visibleCols() {
-  // visible columns for content (prompt consumes some columns)
-  size_t p = promptLen();
-  if (g_term_cols <= p + 8) return 16;  // fallback if terminal is tiny or unknown
-  size_t v = g_term_cols - p;
-  if (v < 8) v = 8;
-  return v;
-}
-static void historyPush(const char* s, size_t len) {
-  if (!s || len == 0) return;
-  // Avoid duplicate of last entry
-  if (g_history_count > 0) {
-    const char* last = g_history[g_history_count - 1];
-    if (strncmp(last, s, HISTORY_ENTRY_MAX - 1) == 0 && strlen(last) == len) return;
-  }
-  if (g_history_count < HISTORY_MAX) {
-    // append
-    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_history[g_history_count], s, L);
-    g_history[g_history_count][L] = 0;
-    g_history_count++;
-  } else {
-    // shift left
-    for (int i = 1; i < HISTORY_MAX; ++i) {
-      strncpy(g_history[i - 1], g_history[i], HISTORY_ENTRY_MAX);
-      g_history[i - 1][HISTORY_ENTRY_MAX - 1] = 0;
-    }
-    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_history[HISTORY_MAX - 1], s, L);
-    g_history[HISTORY_MAX - 1][L] = 0;
-  }
-}
-static void adjustViewToCursor() {
-  size_t vcols = visibleCols();
-  // Ensure cursor is within [g_view_start, g_view_start + vcols - 1]
-  if (g_cursor < g_view_start) {
-    g_view_start = g_cursor;
-  } else if (g_cursor >= g_view_start + vcols) {
-    g_view_start = g_cursor - (vcols - 1);
-  }
-  // If the tail got shorter, try to bring view back left so we don’t leave lots of empty cols
-  size_t maxStart = (g_line_len > vcols) ? (g_line_len - vcols) : 0;
-  if (g_view_start > maxStart) g_view_start = maxStart;
-}
-static void renderLine() {
-  adjustViewToCursor();
-
-  // Clear current row and repaint compact window
-  Serial.print("\r\x1b[2K");  // CR + clear entire line
-  Serial.print(PROMPT);
-
-  size_t vcols = visibleCols();
-  if (g_line_len > 0) {
-    size_t visLen = (g_line_len > g_view_start) ? (g_line_len - g_view_start) : 0;
-    if (visLen > vcols) visLen = vcols;
-    if (visLen) Serial.write(lineBuf + g_view_start, visLen);
-  }
-
-  // Place cursor at logical position within the single row
-  size_t col = promptLen() + (g_cursor - g_view_start);
-  Serial.print("\r\x1b[");
-  Serial.print((unsigned)col);
-  Serial.print('C');
-
-  g_last_render_len = g_line_len;
-}
-static void setLineFrom(const char* s) {
-  if (!s) s = "";
-  size_t L = strlen(s);
-  if (L > maxLineLen()) L = maxLineLen();
-  memcpy(lineBuf, s, L);
-  g_line_len = L;
-  lineBuf[g_line_len] = 0;
-  g_cursor = g_line_len;
-  g_view_start = (g_line_len > visibleCols()) ? (g_line_len - visibleCols()) : 0;
-  renderLine();
-}
-static void beginBrowseIfNeeded() {
-  if (g_history_browse == -1) {
-    // save current edit buffer (for restore on down past newest)
-    size_t L = (g_line_len < (HISTORY_ENTRY_MAX - 1)) ? g_line_len : (HISTORY_ENTRY_MAX - 1);
-    memcpy(g_saved_before_browse, lineBuf, L);
-    g_saved_before_browse[L] = 0;
-    g_saved_before_browse_len = L;
-  }
-}
-static void browseUp() {
-  if (g_history_count == 0) return;
-  beginBrowseIfNeeded();
-  if (g_history_browse < (g_history_count - 1)) {
-    g_history_browse++;
-    int idx = g_history_count - 1 - g_history_browse;
-    setLineFrom(g_history[idx]);
-  }
-}
-static void browseDown() {
-  if (g_history_browse < 0) return;
-  if (g_history_browse > 0) {
-    g_history_browse--;
-    int idx = g_history_count - 1 - g_history_browse;
-    setLineFrom(g_history[idx]);
-  } else {
-    // exit browse, restore saved
-    g_history_browse = -1;
-    size_t L = (g_saved_before_browse_len < sizeof(lineBuf) - 1) ? g_saved_before_browse_len : (sizeof(lineBuf) - 1);
-    memcpy(lineBuf, g_saved_before_browse, L);
-    g_line_len = L;
-    lineBuf[g_line_len] = 0;
-    g_cursor = g_line_len;
-    g_view_start = (g_line_len > visibleCols()) ? (g_line_len - visibleCols()) : 0;
-    renderLine();
-  }
-}
-enum EscState {
-  ES_Normal,
-  ES_GotEsc,
-  ES_CSI,
-  ES_SS3,
-  ES_CSI_Param
-};
-static bool readLine() {
-  static EscState esc = ES_Normal;
-  static int csi_param = 0;
-  bool lineReady = false;
-  while (Serial.available()) {
-    int ic = Serial.read();
-    if (ic < 0) break;
-    char c = (char)ic;
-    if (esc == ES_Normal) {
-      if (c == '\r' || c == '\n') {
-        // Eat CRLF combo
-        if (c == '\r') {
-          if (Serial.available()) {
-            int p = Serial.peek();
-            if (p == '\n') Serial.read();
-          }
-        }
-        Serial.write('\r');
-        Serial.write('\n');
-        // Commit line
-        lineBuf[g_line_len] = 0;
-        // Push to history (non-empty)
-        if (g_line_len > 0) historyPush(lineBuf, g_line_len);
-        // Reset browsing state
-        g_history_browse = -1;
-        g_saved_before_browse[0] = 0;
-        g_saved_before_browse_len = 0;
-        // Reset render state for new prompt
-        g_last_render_len = 0;
-        g_cursor = 0;
-        g_line_len = 0;
-        g_view_start = 0;
-        lineReady = true;
-        break;
-      } else if ((c == 0x08) || (c == 0x7F)) {
-        // Backspace
-        if (g_cursor > 0) {
-          for (size_t i = g_cursor - 1; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
-          g_line_len--;
-          g_cursor--;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        } else {
-          Serial.write('\a');
-        }
-        continue;
-      } else if (c == 0x1B) {
-        esc = ES_GotEsc;
-        csi_param = 0;
-        continue;
-      } else if (c == '\t') {
-        // Simple tab: insert 2 spaces
-        if (g_line_len + 2 <= maxLineLen()) {
-          for (size_t i = g_line_len + 1; i >= g_cursor + 2; --i) lineBuf[i] = lineBuf[i - 2];
-          lineBuf[g_cursor] = ' ';
-          lineBuf[g_cursor + 1] = ' ';
-          g_cursor += 2;
-          g_line_len += 2;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        } else {
-          Serial.write('\a');
-        }
-        continue;
-      } else if (c == 0x01) {
-        // Ctrl+A -> Home
-        g_cursor = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x05) {
-        // Ctrl+E -> End
-        g_cursor = g_line_len;
-        renderLine();
-        continue;
-      } else if (c == 0x0B) {
-        // Ctrl+K -> kill to end
-        g_line_len = g_cursor;
-        lineBuf[g_line_len] = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x15) {
-        // Ctrl+U -> clear line
-        g_cursor = 0;
-        g_line_len = 0;
-        lineBuf[0] = 0;
-        g_view_start = 0;
-        renderLine();
-        continue;
-      } else if (c == 0x0C) {
-        // Ctrl+L -> redraw line (simple)
-        Serial.println();
-        renderLine();
-        continue;
-      } else if (c >= 32 && c <= 126) {
-        // Printable: insert at cursor
-        if (g_line_len + 1 <= maxLineLen()) {
-          for (size_t i = g_line_len; i > g_cursor; --i) lineBuf[i] = lineBuf[i - 1];
-          lineBuf[g_cursor] = c;
-          g_line_len++;
-          g_cursor++;
-          lineBuf[g_line_len] = 0;
-          renderLine();
-        } else {
-          Serial.write('\a');
-        }
-        continue;
-      } else {
-        // ignore others
-        continue;
-      }
-    } else if (esc == ES_GotEsc) {
-      if (c == '[') {
-        esc = ES_CSI;
-      } else if (c == 'O') {
-        esc = ES_SS3;  // function key like Home/End variants
-      } else {
-        esc = ES_Normal;
-      }
-    } else if (esc == ES_SS3) {
-      // Expect 'H' (Home) or 'F' (End)
-      if (c == 'H') {
-        g_cursor = 0;
-        renderLine();
-      } else if (c == 'F') {
-        g_cursor = g_line_len;
-        renderLine();
-      }
-      esc = ES_Normal;
-    } else if (esc == ES_CSI) {
-      if (c >= '0' && c <= '9') {
-        csi_param = (csi_param * 10) + (c - '0');
-        esc = ES_CSI_Param;
-      } else {
-        // single-char CSI
-        if (c == 'A') {
-          // Up
-          browseUp();
-        } else if (c == 'B') {
-          // Down
-          browseDown();
-        } else if (c == 'C') {
-          // Right
-          if (g_cursor < g_line_len) {
-            g_cursor++;
-            renderLine();
-          }
-        } else if (c == 'D') {
-          // Left
-          if (g_cursor > 0) {
-            g_cursor--;
-            renderLine();
-          }
-        } else if (c == 'H') {
-          g_cursor = 0;
-          renderLine();
-        } else if (c == 'F') {
-          g_cursor = g_line_len;
-          renderLine();
-        }
-        esc = ES_Normal;
-        csi_param = 0;
-      }
-    } else if (esc == ES_CSI_Param) {
-      if (c >= '0' && c <= '9') {
-        csi_param = (csi_param * 10) + (c - '0');
-      } else if (c == '~') {
-        // well-known: 3~ = Delete
-        if (csi_param == 3) {
-          if (g_cursor < g_line_len) {
-            for (size_t i = g_cursor; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
-            g_line_len--;
-            lineBuf[g_line_len] = 0;
-            renderLine();
-          } else {
-            Serial.write('\a');
-          }
-        } else if (csi_param == 1 || csi_param == 7) {
-          g_cursor = 0;
-          renderLine();
-        } else if (csi_param == 4 || csi_param == 8) {
-          g_cursor = g_line_len;
-          renderLine();
-        }
-        esc = ES_Normal;
-        csi_param = 0;
-      } else {
-        esc = ES_Normal;
-        csi_param = 0;
-      }
-    }
-  }
-  return lineReady;
-}
-
 // ========== Compile Tiny-C source file -> raw Thumb binary on FS ==========
 static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos) {
   const size_t CONTEXT = 40;
@@ -1031,6 +695,7 @@ static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos)
   Console.println("^");
   Console.println("-------------------");
 }
+
 static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   if (!checkNameLen(srcName) || !checkNameLen(dstName)) return false;
   if (!activeFs.exists(srcName)) {
@@ -1056,6 +721,7 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     return false;
   }
   srcBuf[srcSize] = 0;
+
   // Prepare output buffer
   uint32_t outCap = (srcSize * 12u) + 256u;
   if (outCap < 512u) outCap = 512u;
@@ -1065,6 +731,7 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     free(srcBuf);
     return false;
   }
+
   MCCompiler comp;
   size_t outSize = 0;
   MCCompiler::Result r = comp.compile(srcBuf, srcSize, outBuf, outCap, &outSize);
@@ -1078,6 +745,7 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
     free(srcBuf);
     return false;
   }
+
   // Write to destination file
   bool ok = writeBinaryToFS(dstName, outBuf, (uint32_t)outSize);
   if (ok) {
@@ -1112,9 +780,11 @@ static int nextToken(char*& p, char*& tok) {
   }
   return 1;
 }
+
 static void printHelp() {
   Console.println("Commands (filename max 32 chars):");
   Console.println("  help                         - this help");
+  Console.println("  editor [on|off|auto|status]  - toggle/editing mode; Basic=monitor, Advanced=ANSI+history");
   Console.println("  storage                      - show active storage");
   Console.println("  storage flash|psram|nand     - switch storage backend");
   Console.println("  mode                         - show mode (dev/prod)");
@@ -1191,13 +861,17 @@ static void printHelp() {
   Console.println();
   Console.println("Linux hints: base64 -w0 your.bin  |  xxd -p -c 999999 your.bin | tr -d '\\n'");
 }
-#include "NanoishTextEditor.h"
+
+#include "TextEditor.h"
+
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
   if (!nextToken(p, t0)) return;
+
   if (!strcmp(t0, "help")) {
     printHelp();
+
   } else if (!strcmp(t0, "nano") || !strcmp(t0, "edit")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1208,26 +882,50 @@ static void handleCommand(char* line) {
     Console.printf("Opening editor for '%s'...\n", fn);
     runNanoEditor(fn);
     Console.println("Returned to console.");
-  } else if (!strcmp(t0, "history")) {
-    int start = (g_history_count > HISTORY_MAX) ? (g_history_count - HISTORY_MAX) : 0;
-    for (int i = start; i < g_history_count; ++i) {
-      Console.printf("  %2d  %s\n", i - start + 1, g_history[i]);
+
+  } else if (!strcmp(t0, "editor")) {
+    char* arg = nullptr;
+    if (!nextToken(p, arg) || !strcmp(arg, "status")) {
+      Console.print("editor: ");
+      Console.println(shline::mode(g_le) == shline::Mode::Advanced ? "on (ANSI)" : "off (basic)");
+      return;
     }
+    if (!strcmp(arg, "on")) {
+      shline::setMode(g_le, shline::Mode::Advanced);
+      Console.println("editor: on (ANSI)");
+    } else if (!strcmp(arg, "off")) {
+      shline::setMode(g_le, shline::Mode::Basic);
+      Console.println("editor: off (basic)");
+    } else if (!strcmp(arg, "auto")) {
+      bool ok = shline::probeAnsiSupport(g_le);
+      shline::setMode(g_le, ok ? shline::Mode::Advanced : shline::Mode::Basic);
+      Console.print("editor: ");
+      Console.println(ok ? "on (ANSI detected)" : "off (no ANSI)");
+    } else {
+      Console.println("usage: editor [on|off|auto|status]");
+    }
+    return;
+
+  } else if (!strcmp(t0, "history")) {
+    int count = g_le.history_count;
+    for (int i = 0; i < count; ++i) {
+      Console.printf("  %2d  %s\n", i + 1, g_le.history[i]);
+    }
+
   } else if (!strcmp(t0, "termwidth")) {
     char* cstr;
     if (!nextToken(p, cstr)) {
       Console.print("termwidth: ");
-      Console.print((unsigned)g_term_cols);
+      Console.print((unsigned)g_le.term_cols);
       Console.println(" cols");
     } else {
       size_t cols = (size_t)strtoul(cstr, nullptr, 0);
-      if (cols < 20) cols = 20;
-      if (cols > 240) cols = 240;
-      g_term_cols = cols;
+      shline::setTerminalCols(g_le, cols);
       Console.print("termwidth set to ");
-      Console.print((unsigned)g_term_cols);
+      Console.print((unsigned)g_le.term_cols);
       Console.println(" cols");
     }
+
   } else if (!strcmp(t0, "storage")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1261,6 +959,7 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: storage [flash|psram|nand]");
     }
+
   } else if (!strcmp(t0, "mode")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1275,6 +974,7 @@ static void handleCommand(char* line) {
       g_dev_mode = false;
       Console.println("mode=prod");
     } else Console.println("usage: mode [dev|prod]");
+
   } else if (!strcmp(t0, "persist")) {
     char* tok;
     if (!nextToken(p, tok)) {
@@ -1320,10 +1020,13 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: persist [read|write]");
     }
+
   } else if (!strcmp(t0, "autogen")) {
     autogenBlobWrites();
+
   } else if (!strcmp(t0, "files")) {
     activeFs.listFilesToSerial();
+
   } else if (!strcmp(t0, "info")) {
     char* fn;
     if (!nextToken(p, fn)) {
@@ -1340,6 +1043,7 @@ static void handleCommand(char* line) {
       Console.print(" cap=");
       Console.println(c);
     } else Console.println("not found");
+
   } else if (!strcmp(t0, "dump")) {
     char* fn;
     char* nstr;
@@ -1348,6 +1052,7 @@ static void handleCommand(char* line) {
       return;
     }
     dumpFileHead(fn, (uint32_t)strtoul(nstr, nullptr, 0));
+
   } else if (!strcmp(t0, "mkSlot")) {
     char* fn;
     char* nstr;
@@ -1359,6 +1064,7 @@ static void handleCommand(char* line) {
     uint32_t res = (uint32_t)strtoul(nstr, nullptr, 0);
     if (activeFs.createFileSlot(fn, res, nullptr, 0)) Console.println("slot created");
     else Console.println("mkSlot failed");
+
   } else if (!strcmp(t0, "writeblob")) {
     char* fn;
     char* bid;
@@ -1374,6 +1080,7 @@ static void handleCommand(char* line) {
     }
     if (ensureBlobFile(fn, br->data, br->len)) Console.println("writeblob OK");
     else Console.println("writeblob failed");
+
   } else if (!strcmp(t0, "cat")) {
     char* fn;
     char* nstr;
@@ -1384,6 +1091,7 @@ static void handleCommand(char* line) {
     }
     if (nextToken(p, nstr)) limit = (uint32_t)strtoul(nstr, nullptr, 0);
     if (!checkNameLen(fn)) return;
+
     uint32_t sz = 0;
     if (!activeFs.getFileSize(fn, sz)) {
       Console.println("cat: not found");
@@ -1414,6 +1122,7 @@ static void handleCommand(char* line) {
       yield();
     }
     Serial.write('\n');
+
   } else if (!strcmp(t0, "cp")) {
     // cp <src> <dst|folder/> [-f]
     char* srcArg;
@@ -1434,6 +1143,7 @@ static void handleCommand(char* line) {
     if (!cmdCpImpl(g_cwd, srcArg, dstArg, force)) {
       Console.println("cp failed");
     }
+
   } else if (!strcmp(t0, "fscp")) {
     // fscp <srcFS:path> <dstFS:path|folder/> [-f]
     char* srcSpec;
@@ -1455,8 +1165,10 @@ static void handleCommand(char* line) {
     if (!cmdFsCpImpl(srcSpec, dstSpec, force)) {
       Console.println("fscp failed");
     }
+
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
+
   } else if (!strcmp(t0, "rescanfs")) {
     size_t found = uniMem.rescan(50000UL);
     Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
@@ -1465,6 +1177,7 @@ static void handleCommand(char* line) {
       if (!di) continue;
       Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
     }
+
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
     Console.printf("Total Heap:        %d bytes\n", rp2040.getTotalHeap());
@@ -1479,14 +1192,17 @@ static void handleCommand(char* line) {
     Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
 #endif
     psramPrintCapacityReport(uniMem);
+
   } else if (!strcmp(t0, "psramsmoketest")) {
     psramPrintCapacityReport(uniMem);
     psramSafeSmokeTest(fsPSRAM);
+
   } else if (!strcmp(t0, "reboot")) {
     Console.printf("Rebooting..\n");
     delay(20);
     yield();
     rp2040.reboot();
+
   } else if (!strcmp(t0, "del") || !strcmp(t0, "rm")) {
     char* arg;
     if (!nextToken(p, arg)) {
@@ -1509,9 +1225,11 @@ static void handleCommand(char* line) {
       if (activeFs.exists && activeFs.exists(alt)) ok = activeFs.deleteFile(alt);
     }
     Console.println(ok ? "deleted" : "delete failed");
+
   } else if (!strcmp(t0, "format")) {
     if (activeFs.format && activeFs.format()) Console.println("FS formatted");
     else Console.println("format failed");
+
   } else if (!strcmp(t0, "wipebootloader")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1520,6 +1238,7 @@ static void handleCommand(char* line) {
       yield();
       rp2040.rebootToBootloader();
     } else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "wipereboot")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) {
@@ -1528,10 +1247,12 @@ static void handleCommand(char* line) {
       yield();
       rp2040.reboot();
     } else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "wipe")) {
     Console.println("Erasing entire chip... this can take a while");
     if (activeFs.wipeChip && activeFs.wipeChip()) Console.println("Chip wiped");
     else Console.println("wipe failed");
+
   } else if (!strcmp(t0, "puthex")) {
     char* fn;
     char* hex;
@@ -1556,6 +1277,7 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("puthex: write failed");
+
   } else if (!strcmp(t0, "putb64")) {
     char* fn;
     char* b64;
@@ -1580,6 +1302,7 @@ static void handleCommand(char* line) {
       Console.println(fn);
       if (binLen & 1u) Console.println("note: odd-sized file; if used as Thumb blob, exec will reject (needs even bytes).");
     } else Console.println("putb64: write failed");
+
   } else if (!strcmp(t0, "putb64s")) {
     char* fn;
     char* opt;
@@ -1597,6 +1320,7 @@ static void handleCommand(char* line) {
     // Begin streaming upload; shb64 interacts with Serial directly, like your old code
     shb64s::begin(g_b64, Serial, fn, expected, writeBinaryToFS);
     return;  // loop() will pump until completion
+
   } else if (!strcmp(t0, "hash") || !strcmp(t0, "sha256")) {
     char* fn;
     char* algo = nullptr;
@@ -1615,6 +1339,7 @@ static void handleCommand(char* line) {
     printHexLower(dig, sizeof(dig));
     Serial.write(' ');
     Serial.println(fn);
+
   } else if (!strcmp(t0, "cc")) {
     char* src;
     char* dst;
@@ -1626,9 +1351,11 @@ static void handleCommand(char* line) {
     if (!compileTinyCFileToFile(src, dst)) {
       Console.println("cc: failed");
     }
+
   } else if (!strcmp(t0, "pwd")) {
     Console.print("cwd: /");
     Console.println(g_cwd);
+
   } else if (!strcmp(t0, "cd")) {
     char* arg;
     if (!nextToken(p, arg)) {
@@ -1663,6 +1390,7 @@ static void handleCommand(char* line) {
     strncpy(g_cwd, target, sizeof(g_cwd));
     g_cwd[sizeof(g_cwd) - 1] = 0;
     Console.println("ok");
+
   } else if (!strcmp(t0, "mkdir")) {
     char* arg;
     if (!nextToken(p, arg)) {
@@ -1684,6 +1412,7 @@ static void handleCommand(char* line) {
     }
     if (mkdirFolder(marker)) Console.println("mkdir: ok");
     else Console.println("mkdir: failed");
+
   } else if (!strcmp(t0, "ls")) {
     char* arg;
     char folder[ActiveFS::MAX_NAME + 1] = { 0 };
@@ -1799,11 +1528,13 @@ static void handleCommand(char* line) {
         }
       }
     }
+
   } else if (!strcmp(t0, "lsdebug")) {
     char* nstr;
     uint32_t n = 256;
     if (nextToken(p, nstr)) n = (uint32_t)strtoul(nstr, nullptr, 0);
     dumpDirHeadRaw(n);
+
   } else if (!strcmp(t0, "rmdir")) {
     char* arg;
     if (!nextToken(p, arg)) {
@@ -1813,6 +1544,7 @@ static void handleCommand(char* line) {
     bool recursive = false;
     char* opt;
     if (nextToken(p, opt) && !strcmp(opt, "-r")) recursive = true;
+
     char folder[ActiveFS::MAX_NAME + 1];
     if (!pathJoin(folder, sizeof(folder), g_cwd, arg, /*wantTrailingSlash*/ true)) {
       Console.println("rmdir: path too long");
@@ -1858,6 +1590,7 @@ static void handleCommand(char* line) {
     } else {
       Console.println("rmdir: marker not found (already removed?)");
     }
+
   } else if (!strcmp(t0, "touch")) {
     char* pathArg;
     if (!nextToken(p, pathArg)) {
@@ -1869,8 +1602,10 @@ static void handleCommand(char* line) {
     } else {
       Console.println("touch failed");
     }
+
   } else if (!strcmp(t0, "df")) {
     cmdDf();
+
   } else if (!strcmp(t0, "mv")) {
     char* srcArg;
     char* dstArg;
@@ -1881,6 +1616,7 @@ static void handleCommand(char* line) {
     if (!cmdMvImpl(g_cwd, srcArg, dstArg)) {
       Console.println("mv failed");
     }
+
   } else if (!strcmp(t0, "lsraw")) {
     FsIndexEntry idx[64];
     size_t n = buildFsIndex(idx, 64);
@@ -1888,6 +1624,7 @@ static void handleCommand(char* line) {
       if (idx[i].deleted) continue;
       Console.printf("- %s  (%lu bytes)\n", idx[i].name, (unsigned long)idx[i].size);
     }
+
   } else if (!strcmp(t0, "wav")) {
     char* sub = nullptr;
     if (!nextToken(p, sub)) {
@@ -1931,6 +1668,7 @@ static void handleCommand(char* line) {
     } else {
       Console.println("usage: wav play|playpwm|playpwmdac|dacperf");
     }
+
   } else if (!strcmp(t0, "tone")) {
     // tone <pin> <half_us> <cycles>
     char* pPin = nullptr;
@@ -1944,6 +1682,7 @@ static void handleCommand(char* line) {
     int halfUs = (int)strtol(pHalf, nullptr, 0);
     int cyc = (int)strtol(pCyc, nullptr, 0);
     if (!Audio.toneDigital(pin, halfUs, cyc)) Console.println("tone failed");
+
   } else if (!strcmp(t0, "midi")) {
     char* sub = nullptr;
     if (!nextToken(p, sub)) {
@@ -1959,7 +1698,6 @@ static void handleCommand(char* line) {
       Console.println("  midi play pwmdac <file> [gapMs] [wave=sine|square|saw] [amp%] [sr]");
       return;
     }
-
     if (!strcmp(sub, "status")) {
       Console.println("midi status:");
       Console.printf("  debug:     %s\n", midiDebugName(g_midi_debug));
@@ -2063,6 +1801,7 @@ static void handleCommand(char* line) {
         char* gap = nullptr;
         if (nextToken(p, gap)) cfg.gapMs = (int)strtol(gap, nullptr, 0);
         if (!MIDI.playSMF(fn, cfg, midiWork, sizeof(midiWork))) Console.println("midi buzz failed");
+
       } else if (!strcmp(mode, "pwm")) {
         cfg.backend = MidiPlayer::Backend::PWMSquare;
         cfg.outPin = PIN_BUZZER;  // default to GP29
@@ -2071,11 +1810,13 @@ static void handleCommand(char* line) {
         char* pinStr = nullptr;
         if (nextToken(p, pinStr)) cfg.outPin = (int)strtol(pinStr, nullptr, 0);
         if (!MIDI.playSMF(fn, cfg, midiWork, sizeof(midiWork))) Console.println("midi pwm failed");
+
       } else if (!strcmp(mode, "dac") || !strcmp(mode, "pwmdac")) {
         cfg.backend = !strcmp(mode, "dac") ? MidiPlayer::Backend::DAC : MidiPlayer::Backend::PWMDAC;
         cfg.waveform = MidiPlayer::Waveform::Sine;
         cfg.dacAmpPercent = 60;
         cfg.sampleRate = 22050;
+
         char* gap = nullptr;
         if (nextToken(p, gap)) cfg.gapMs = (int)strtol(gap, nullptr, 0);
         char* wstr = nullptr;
@@ -2089,9 +1830,11 @@ static void handleCommand(char* line) {
         char* sr = nullptr;
         if (nextToken(p, sr)) cfg.sampleRate = (uint32_t)strtoul(sr, nullptr, 0);
         if (!MIDI.playSMF(fn, cfg, midiWork, sizeof(midiWork))) Console.println("midi dac/pwmdac failed");
+
       } else {
         Console.println("usage: midi play <buzz|pwm|dac|pwmdac> <file> [...]");
       }
+
     } else {
       Console.println("midi cmds:");
       Console.println("  midi status");
@@ -2104,23 +1847,28 @@ static void handleCommand(char* line) {
       Console.println("  midi play dac    <file> [gapMs] [wave=sine|square|saw] [amp%] [sr]");
       Console.println("  midi play pwmdac <file> [gapMs] [wave=sine|square|saw] [amp%] [sr]");
     }
+
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
 }
+
 // ========== Setup and main loops ==========
 void setup() {
   delay(500);
   Serial.begin(115200);
   while (!Serial) { delay(20); }
   delay(20);
+
   Console.println("System booting..");
   Console.begin();
+
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   //uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
   //uniMem.setCsList({ PIN_NAND_CS });
   uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0 });
+
   // Keep slow scan for robustness
   size_t found = uniMem.rescan(50000UL);
   Console.printf("Unified scan: found %u device(s)\n", (unsigned)found);
@@ -2129,19 +1877,23 @@ void setup() {
     if (!di) continue;
     Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
   }
+
   bool nandOk = fsNAND.begin(uniMem);
   bool flashOk = fsFlash.begin(uniMem);
   bool psramOk = fsPSRAM.begin(uniMem);
   if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+
   shfs_bindDevices(&fsFlash, &fsPSRAM, &fsNAND, &uniMem);
   shfs_setPrint(&Console);  // optional
   bindActiveFs(g_storage);
+
   bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
+
   // ---- Audio (WAV) + MIDI attach to FS/console/hooks ----
   // Audio
   {
@@ -2159,6 +1911,7 @@ void setup() {
     // PWM path defaults: buzzer on GP29, ~62.5kHz carrier, 8-bit range
     Audio.beginPWM(/*defaultPin*/ PIN_BUZZER, /*carrierHz*/ 62500, /*dutyRange*/ 127);
   }
+
   // MIDI
   {
     MidiPlayer::FS mfs{};
@@ -2176,34 +1929,52 @@ void setup() {
     MIDI.setMonitorSerialForQ(true);
     MIDI.beginPWM(255);
   }
+
   // ---- SPI bus alignment for MCP4921 on the SAME bus as UnifiedSpiMem ----
   // Important: set SPI pin mapping BEFORE SPI.begin(), so MCP_DAC uses SCK=6 MOSI=3 MISO=4 like your memories
   SPI.setSCK(PIN_FLASH_SCK);    // GP6
   SPI.setMOSI(PIN_FLASH_MOSI);  // GP3
   SPI.setMISO(PIN_FLASH_MISO);  // GP4
   SPI.begin();
+
   // Keep DAC CS high when idle to avoid spurious selects
   pinMode(PIN_DAC_CS, OUTPUT);
   digitalWrite(PIN_DAC_CS, HIGH);
+
   // MCP4921 on shared bus (CS=GP7). One init only.
   MCP.begin(PIN_DAC_CS);
+
   // Attach the same MCP DAC to both Audio and MIDI libraries
   Audio.attachMCP4921(&MCP);
   MIDI.attachMCP4921(&MCP);
-  Console.printf("System ready. Type 'help'\n> ");
+
+  // Line editor: Basic by default (Arduino Serial Monitor)
+  shline::begin(g_le, Serial, "> ");
+  // Option A: manual selection (recommended), no ANSI
+  //shline::setMode(g_le, shline::Mode::Basic);
+  // Option B: try auto-probe and fall back
+  if (shline::probeAnsiSupport(g_le)) shline::setMode(g_le, shline::Mode::Advanced);
+  else shline::setMode(g_le, shline::Mode::Basic);
+
+  Console.printf("System ready. Type 'help'\n");
+  shline::printPrompt(g_le);
 }
+
 void setup1() {
 }
+
 void loop1() {
   tight_loop_contents();
 }
+
 void loop() {
+  char cmdBuf[SHLINE_MAX_LINE];
   if (shb64s::active(g_b64)) {
     shb64s::pump(g_b64);
     return;
   }
-  if (readLine()) {
-    handleCommand(lineBuf);
-    Console.print("> ");
+  if (shline::poll(g_le, cmdBuf, sizeof(cmdBuf))) {
+    handleCommand(cmdBuf);
+    shline::printPrompt(g_le);  // Advanced mode renders; Basic needs prompt
   }
 }

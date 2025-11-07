@@ -322,32 +322,45 @@ static inline void normalizePathInPlace(char* s, bool wantTrailingSlash) {
 }
 static inline bool pathJoin(char* out, size_t outCap, const char* base, const char* name, bool wantTrailingSlash) {
   if (!out || !name) return false;
+
   if (name[0] == '/') {
     const char* s = name + 1;
     size_t L = strlen(s);
-    if (L > ActiveFS::MAX_NAME || L >= outCap) return false;
-    memcpy(out, s, L + 1);
-    if (wantTrailingSlash && L > 0 && out[L - 1] != '/') {
-      if (L + 2 > outCap || L + 1 > ActiveFS::MAX_NAME) return false;
-      out[L] = '/';
-      out[L + 1] = 0;
+    if (wantTrailingSlash && L > 0 && s[L - 1] != '/') {
+      if (L + 1 > ActiveFS::MAX_NAME || L + 2 > outCap) return false;
+      // Copy into a temp so we can append slash safely.
+      char tmp[ActiveFS::MAX_NAME + 1];
+      if (L >= sizeof(tmp)) return false;
+      memcpy(tmp, s, L);
+      tmp[L++] = '/';
+      tmp[L] = 0;
+      if (L + 1 > outCap) return false;
+      memcpy(out, tmp, L + 1);
+      return true;
     }
+    // No trailing slash needed, copy as-is
+    if (L > ActiveFS::MAX_NAME || L + 1 > outCap) return false;
+    memcpy(out, s, L + 1);
     return true;
   }
+
   if (!base) base = "";
   char tmp[ActiveFS::MAX_NAME + 1];
   int need = 0;
   if (base[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", name);
   else if (name[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", base);
   else need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
+
   if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= sizeof(tmp)) return false;
-  size_t L = strlen(tmp);
+
+  size_t L = (size_t)need;
   if (wantTrailingSlash && L > 0 && tmp[L - 1] != '/') {
-    if (L + 1 > ActiveFS::MAX_NAME) return false;
-    tmp[L] = '/';
-    tmp[L + 1] = 0;
+    if (L + 1 > ActiveFS::MAX_NAME || L + 2 > sizeof(tmp)) return false;
+    tmp[L++] = '/';
+    tmp[L] = 0;
   }
-  if (L >= outCap) return false;
+
+  if (L + 1 > outCap) return false;
   memcpy(out, tmp, L + 1);
   return true;
 }
@@ -543,11 +556,12 @@ static inline bool cmdCpImpl(const char* cwd, const char* srcArg, const char* ds
     shfs_out->println("cp: source not found");
     return false;
   }
-  uint32_t srcAddr = 0, srcSize = 0, srcCap = 0;
-  if (!activeFs.getFileInfo || !activeFs.getFileInfo(srcAbs, srcAddr, srcSize, srcCap)) {
+  uint32_t sAddr = 0, sSize = 0, sCap = 0;
+  if (!activeFs.getFileInfo(srcAbs, sAddr, sSize, sCap)) {
     shfs_out->println("cp: getFileInfo failed");
     return false;
   }
+
   char dstAbs[ActiveFS::MAX_NAME + 1];
   size_t Ldst = strlen(dstArg);
   bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
@@ -577,33 +591,73 @@ static inline bool cmdCpImpl(const char* cwd, const char* srcArg, const char* ds
     shfs_out->println("cp: destination exists (use -f to overwrite)");
     return false;
   }
-  uint8_t* buf = (uint8_t*)malloc(srcSize ? srcSize : 1);
-  if (!buf) {
-    shfs_out->println("cp: malloc failed");
-    return false;
-  }
-  uint32_t got = activeFs.readFile(srcAbs, buf, srcSize);
-  if (got != srcSize) {
-    shfs_out->println("cp: read failed");
-    free(buf);
-    return false;
-  }
+
+  // Prepare destination: prefer keeping the same capacity as source (sCap), rounded to erase align.
   uint32_t eraseAlign = getEraseAlign();
-  uint32_t reserve = srcCap;
+  uint32_t reserve = sCap;
   if (reserve < eraseAlign) {
-    uint32_t a = (srcSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
+    uint32_t a = (sSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
     if (a > reserve) reserve = a;
   }
   if (reserve < eraseAlign) reserve = eraseAlign;
-  bool ok = false;
-  if (!activeFs.exists(dstAbs)) {
-    ok = activeFs.createFileSlot(dstAbs, reserve, buf, srcSize);
-  } else {
-    uint32_t dA, dS, dC;
+
+  bool needCreate = !activeFs.exists(dstAbs);
+  uint32_t dA = 0, dS = 0, dC = 0;
+  if (!needCreate) {
     if (!activeFs.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
-    if (dC >= srcSize) ok = activeFs.writeFileInPlace(dstAbs, buf, srcSize, false);
-    if (!ok) ok = activeFs.writeFile(dstAbs, buf, srcSize, fsReplaceMode());
   }
+
+  // If destination missing: create slot now, write initial chunk in createFileSlot
+  const size_t CHUNK = 2048;
+  uint8_t* buf = (uint8_t*)malloc(CHUNK);
+  if (!buf) {
+    shfs_out->println("cp: OOM");
+    return false;
+  }
+
+  uint32_t off = 0;
+  bool ok = true;
+
+  if (needCreate) {
+    size_t n = (sSize > CHUNK) ? CHUNK : sSize;
+    if (n) {
+      if (activeFs.readFileRange(srcAbs, 0, buf, n) != n) {
+        ok = false;
+      } else ok = activeFs.createFileSlot(dstAbs, reserve, buf, n);
+      off = n;
+    } else {
+      // empty source
+      ok = activeFs.createFileSlot(dstAbs, reserve, nullptr, 0);
+    }
+    if (!ok) {
+      shfs_out->println("cp: create/write failed");
+      free(buf);
+      return false;
+    }
+    if (!activeFs.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;  // refresh
+  }
+
+  // Continue writing remaining bytes
+  while (ok && off < sSize) {
+    size_t n = (sSize - off > CHUNK) ? CHUNK : (sSize - off);
+    if (activeFs.readFileRange(srcAbs, off, buf, n) != n) {
+      ok = false;
+      break;
+    }
+    if (dC >= sSize) {
+      // In-place update (append behavior implemented by full write-in-place if FS supports)
+      ok = activeFs.writeFileInPlace(dstAbs, buf, off + n, true);
+      // If the FS writeFileInPlace semantics do not support progressive append by total size,
+      // fall back to full rewrite:
+      if (!ok) ok = activeFs.writeFile(dstAbs, buf, off + n, fsReplaceMode());
+    } else {
+      // Not enough capacity -> rewrite whole file progressively (last write wins)
+      ok = activeFs.writeFile(dstAbs, buf, off + n, fsReplaceMode());
+    }
+    off += n;
+    yield();
+  }
+
   free(buf);
   if (!ok) {
     shfs_out->println("cp: write failed");
