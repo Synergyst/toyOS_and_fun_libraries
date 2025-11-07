@@ -1,4 +1,4 @@
-// main_mcu.ino
+// main_mcu.ino - Running on WaveShare RP2040-Zero
 #define COPROCLANG_COPY_INPUT 1
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
@@ -39,7 +39,6 @@ struct BlobReg;  // Forward declaration
 static AudioWavOut Audio;
 static MCP4921 MCP;  // for MCP4921 DAC output
 static MidiPlayer MIDI;
-
 // ---- MIDI debug defaults (affect 'midi play' commands) ----
 // Requires MidiPlayer.h updated with Debug enum and progress fields.
 static MidiPlayer::Debug g_midi_debug = MidiPlayer::Debug::Info;  // Off|Errors|Info|Verbose
@@ -47,6 +46,11 @@ static bool g_midi_progress = true;                               // periodic pr
 static uint16_t g_midi_prog_ms = 250;                             // progress interval (ms)
 static int g_midi_track_index = -1;                               // -1 = auto-select by most NoteOn
 static bool g_midi_allow_q = true;                                // allow 'q' to stop playback
+
+#include "shsha256.h"
+#include "shb64.h"
+static shb64s::State g_b64;  // not shb64::State
+#include "shfs.h"
 
 // ========== Static buffer-related compile-time constant ==========
 #define FS_SECTOR_SIZE 4096
@@ -70,12 +74,6 @@ static const uint8_t PIN_BUZZER = 29;  // Buzzer/PWM on GP29
 // ========== Flash/PSRAM instances (needed before bindActiveFs) ==========
 // Persisted config you already have
 const size_t PERSIST_LEN = 32;
-enum class StorageBackend {
-  Flash,
-  PSRAM_BACKEND,
-  NAND,
-};
-static StorageBackend g_storage = StorageBackend::Flash;
 UnifiedSpiMem::Manager uniMem(PIN_PSRAM_SCK, PIN_PSRAM_MOSI, PIN_PSRAM_MISO);  // Unified manager: one bus, many CS
 // SimpleFS facades
 W25QUnifiedSimpleFS fsFlash;
@@ -88,43 +86,6 @@ struct SHA256_CTX {
   uint8_t data[64];
   uint32_t datalen;
 };
-// ========== ActiveFS structure ==========
-struct ActiveFS {
-  bool (*mount)(bool) = nullptr;
-  bool (*format)() = nullptr;
-  bool (*wipeChip)() = nullptr;
-  bool (*exists)(const char*) = nullptr;
-  bool (*createFileSlot)(const char*, uint32_t, const uint8_t*, uint32_t) = nullptr;
-  bool (*writeFile)(const char*, const uint8_t*, uint32_t, int /*mode*/) = nullptr;
-  bool (*writeFileInPlace)(const char*, const uint8_t*, uint32_t, bool) = nullptr;
-  uint32_t (*readFile)(const char*, uint8_t*, uint32_t) = nullptr;
-  uint32_t (*readFileRange)(const char*, uint32_t, uint8_t*, uint32_t) = nullptr;
-  bool (*getFileSize)(const char*, uint32_t&) = nullptr;
-  bool (*getFileInfo)(const char*, uint32_t&, uint32_t&, uint32_t&) = nullptr;
-  bool (*deleteFile)(const char*) = nullptr;
-  void (*listFilesToSerial)() = nullptr;
-  uint32_t (*nextDataAddr)() = nullptr;
-  uint32_t (*capacity)() = nullptr;
-  uint32_t (*dataRegionStart)() = nullptr;
-  static constexpr uint32_t SECTOR_SIZE = FS_SECTOR_SIZE;
-  static constexpr uint32_t PAGE_SIZE = 256;
-  static constexpr size_t MAX_NAME = 32;
-} activeFs;
-struct FsIndexEntry {
-  char name[ActiveFS::MAX_NAME + 1];
-  uint32_t size;
-  bool deleted;
-  uint32_t seq;
-};
-struct FSIface {
-  bool (*mount)(bool);
-  bool (*exists)(const char*);
-  bool (*createFileSlot)(const char*, uint32_t, const uint8_t*, uint32_t);
-  bool (*writeFile)(const char*, const uint8_t*, uint32_t, int);
-  bool (*writeFileInPlace)(const char*, const uint8_t*, uint32_t, bool);
-  uint32_t (*readFile)(const char*, uint8_t*, uint32_t);
-  bool (*getFileInfo)(const char*, uint32_t&, uint32_t&, uint32_t&);
-};
 // Helper to get device for specific backend (used by fscp)
 static inline UnifiedSpiMem::MemDevice* deviceForBackend(StorageBackend backend) {
   switch (backend) {
@@ -133,252 +94,6 @@ static inline UnifiedSpiMem::MemDevice* deviceForBackend(StorageBackend backend)
     case StorageBackend::NAND: return fsNAND.raw().device();
     default: return nullptr;
   }
-}
-static inline UnifiedSpiMem::MemDevice* activeFsDevice() {
-  switch (g_storage) {
-    case StorageBackend::Flash: return fsFlash.raw().device();
-    case StorageBackend::PSRAM_BACKEND: return fsPSRAM.raw().device();
-    case StorageBackend::NAND: return fsNAND.raw().device();
-    default: return nullptr;
-  }
-}
-// Directory stride helper: 32 for NOR/PSRAM, NAND page size when on MX35
-static inline uint32_t dirEntryStride() {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (!dev) return 32u;
-  return (dev->type() == UnifiedSpiMem::DeviceType::SpiNandMX35) ? dev->pageSize() : 32u;
-}
-// Erase alignment helper for reserve rounding (PSRAM => fallback to 4K)
-static inline uint32_t getEraseAlign() {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (!dev) return ActiveFS::SECTOR_SIZE;
-  uint32_t e = dev->eraseSize();
-  return (e > 0) ? e : ActiveFS::SECTOR_SIZE;
-}
-// Erase alignment helper for a specific backend (for fscp)
-static inline uint32_t getEraseAlignFor(StorageBackend b) {
-  UnifiedSpiMem::MemDevice* dev = deviceForBackend(b);
-  if (!dev) return ActiveFS::SECTOR_SIZE;
-  uint32_t e = dev->eraseSize();
-  return (e > 0) ? e : ActiveFS::SECTOR_SIZE;
-}
-static inline int fsReplaceMode() {
-  switch (g_storage) {
-    case StorageBackend::Flash:
-      return (int)W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists;
-    case StorageBackend::NAND:
-      return (int)MX35UnifiedSimpleFS::WriteMode::ReplaceIfExists;
-    case StorageBackend::PSRAM_BACKEND:
-      return 0;
-  }
-  return 0;
-}
-// Replace mode per backend (for fscp)
-static inline int fsReplaceModeFor(StorageBackend b) {
-  switch (b) {
-    case StorageBackend::Flash:
-      return (int)W25QUnifiedSimpleFS::WriteMode::ReplaceIfExists;
-    case StorageBackend::NAND:
-      return (int)MX35UnifiedSimpleFS::WriteMode::ReplaceIfExists;
-    case StorageBackend::PSRAM_BACKEND:
-      return 0;
-  }
-  return 0;
-}
-static void bindActiveFs(StorageBackend backend) {
-  if (backend == StorageBackend::Flash) {
-    activeFs.mount = [](bool b) {
-      return fsFlash.mount(b);
-    };
-    activeFs.format = []() {
-      return fsFlash.format();
-    };
-    activeFs.wipeChip = []() {
-      return fsFlash.wipeChip();
-    };
-    activeFs.exists = [](const char* n) {
-      return fsFlash.exists(n);
-    };
-    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsFlash.createFileSlot(n, r, d, s);
-    };
-    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
-    };
-    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsFlash.writeFileInPlace(n, d, s, a);
-    };
-    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsFlash.readFile(n, b, sz);
-    };
-    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
-      return fsFlash.readFileRange(n, off, b, l);
-    };
-    activeFs.getFileSize = [](const char* n, uint32_t& s) {
-      return fsFlash.getFileSize(n, s);
-    };
-    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsFlash.getFileInfo(n, a, s, c);
-    };
-    activeFs.deleteFile = [](const char* n) {
-      return fsFlash.deleteFile(n);
-    };
-    activeFs.listFilesToSerial = []() {
-      fsFlash.listFilesToSerial();
-    };
-    activeFs.nextDataAddr = []() {
-      return fsFlash.nextDataAddr();
-    };
-    activeFs.capacity = []() {
-      return fsFlash.capacity();
-    };
-    activeFs.dataRegionStart = []() {
-      return fsFlash.dataRegionStart();
-    };
-  } else if (backend == StorageBackend::NAND) {
-    activeFs.mount = [](bool b) {
-      return fsNAND.mount(b);
-    };
-    activeFs.format = []() {
-      return fsNAND.format();
-    };
-    activeFs.wipeChip = []() {
-      return fsNAND.wipeChip();
-    };
-    activeFs.exists = [](const char* n) {
-      return fsNAND.exists(n);
-    };
-    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsNAND.createFileSlot(n, r, d, s);
-    };
-    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
-    };
-    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsNAND.writeFileInPlace(n, d, s, a);
-    };
-    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsNAND.readFile(n, b, sz);
-    };
-    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
-      return fsNAND.readFileRange(n, off, b, l);
-    };
-    activeFs.getFileSize = [](const char* n, uint32_t& s) {
-      return fsNAND.getFileSize(n, s);
-    };
-    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsNAND.getFileInfo(n, a, s, c);
-    };
-    activeFs.deleteFile = [](const char* n) {
-      return fsNAND.deleteFile(n);
-    };
-    activeFs.listFilesToSerial = []() {
-      fsNAND.listFilesToSerial();
-    };
-    activeFs.nextDataAddr = []() {
-      return fsNAND.nextDataAddr();
-    };
-    activeFs.capacity = []() {
-      return fsNAND.capacity();
-    };
-    activeFs.dataRegionStart = []() {
-      return fsNAND.dataRegionStart();
-    };
-  } else {
-    activeFs.mount = [](bool b) {
-      return fsPSRAM.mount(b);
-    };
-    activeFs.format = []() {
-      return fsPSRAM.format();
-    };
-    activeFs.wipeChip = []() {
-      return fsPSRAM.wipeChip();
-    };
-    activeFs.exists = [](const char* n) {
-      return fsPSRAM.exists(n);
-    };
-    activeFs.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsPSRAM.createFileSlot(n, r, d, s);
-    };
-    activeFs.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsPSRAM.writeFile(n, d, s, m);
-    };
-    activeFs.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsPSRAM.writeFileInPlace(n, d, s, a);
-    };
-    activeFs.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsPSRAM.readFile(n, b, sz);
-    };
-    activeFs.readFileRange = [](const char* n, uint32_t off, uint8_t* b, uint32_t l) {
-      return fsPSRAM.readFileRange(n, off, b, l);
-    };
-    activeFs.getFileSize = [](const char* n, uint32_t& s) {
-      return fsPSRAM.getFileSize(n, s);
-    };
-    activeFs.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsPSRAM.getFileInfo(n, a, s, c);
-    };
-    activeFs.deleteFile = [](const char* n) {
-      return fsPSRAM.deleteFile(n);
-    };
-    activeFs.listFilesToSerial = []() {
-      fsPSRAM.listFilesToSerial();
-    };
-    activeFs.nextDataAddr = []() {
-      return fsPSRAM.nextDataAddr();
-    };
-    activeFs.capacity = []() {
-      return fsPSRAM.capacity();
-    };
-    activeFs.dataRegionStart = []() {
-      return fsPSRAM.dataRegionStart();
-    };
-  }
-}
-static bool makePath(char* out, size_t outCap, const char* folder, const char* name) {
-  if (!out || !folder || !name) return false;
-  int needed = snprintf(out, outCap, "%s/%s", folder, name);
-  if (needed < 0) return false;
-  if ((size_t)needed > ActiveFS::MAX_NAME) return false;
-  if ((size_t)needed >= outCap) return false;
-  return true;
-}
-static void normalizePathInPlace(char* s, bool wantTrailingSlash) {
-  if (!s) return;
-  size_t r = 0;
-  while (s[r] == '/') ++r;
-  size_t w = 0;
-  for (; s[r]; ++r) {
-    char c = s[r];
-    if (c == '/' && w > 0 && s[w - 1] == '/') continue;
-    s[w++] = c;
-  }
-  s[w] = 0;
-  size_t n = strlen(s);
-  if (wantTrailingSlash) {
-    if (n > 0 && s[n - 1] != '/') {
-      if (n + 1 < ActiveFS::MAX_NAME + 1) {
-        s[n] = '/';
-        s[n + 1] = 0;
-      }
-    }
-  } else {
-    while (n > 0 && s[n - 1] == '/') { s[--n] = 0; }
-  }
-}
-static bool makePathSafe(char* out, size_t outCap, const char* folder, const char* name) {
-  if (!out || !folder || !name) return false;
-  char tmp[ActiveFS::MAX_NAME + 1];
-  if (folder[0] == 0) {
-    if (snprintf(tmp, sizeof(tmp), "%s", name) < 0) return false;
-  } else {
-    if (snprintf(tmp, sizeof(tmp), "%s/%s", folder, name) < 0) return false;
-  }
-  normalizePathInPlace(tmp, /*wantTrailingSlash=*/false);
-  size_t L = strlen(tmp);
-  if (L > ActiveFS::MAX_NAME || L >= outCap) return false;
-  memcpy(out, tmp, L + 1);
-  return true;
 }
 static bool writeFileToFolder(const char* folder, const char* fname, const uint8_t* data, uint32_t len) {
   char path[ActiveFS::MAX_NAME + 1];
@@ -403,235 +118,6 @@ static uint32_t readFileFromFolder(const char* folder, const char* fname, uint8_
   }
   return activeFs.readFile(path, buf, bufSize);
 }
-static bool folderExists(const char* absFolder) {
-  if (!absFolder || !absFolder[0]) return false;
-  if (absFolder[strlen(absFolder) - 1] != '/') return false;
-  return activeFs.exists(absFolder);
-}
-static bool mkdirFolder(const char* path) {
-  if (activeFs.exists(path)) return true;
-  return activeFs.writeFile(path, nullptr, 0, fsReplaceMode());
-}
-static bool touchPath(const char* cwd, const char* arg) {
-  if (!arg) return false;
-  size_t L = strlen(arg);
-  if (L > 0 && arg[L - 1] == '/') {
-    char marker[ActiveFS::MAX_NAME + 1];
-    if (!pathJoin(marker, sizeof(marker), cwd, arg, /*wantTrailingSlash=*/true)) {
-      Console.println("touch: folder path too long (<= 32 chars)");
-      return false;
-    }
-    if (folderExists(marker)) return true;
-    return mkdirFolder(marker);
-  }
-  char path[ActiveFS::MAX_NAME + 1];
-  if (!pathJoin(path, sizeof(path), cwd, arg, /*wantTrailingSlash=*/false)) {
-    Console.println("touch: path too long (<= 32 chars)");
-    return false;
-  }
-  if (activeFs.exists(path)) {
-    return true;
-  }
-  return activeFs.writeFile(path, /*data*/ nullptr, /*size*/ 0, fsReplaceMode());
-}
-// ========== mv helpers ==========
-static const char* lastSlash(const char* s) {
-  const char* p = strrchr(s, '/');
-  return p ? (p + 1) : s;
-}
-static bool buildAbsFile(char* out, size_t outCap, const char* cwd, const char* path) {
-  if (!path || !out) return false;
-  size_t L = strlen(path);
-  if (L > 0 && path[L - 1] == '/') return false;
-  return pathJoin(out, outCap, cwd, path, /*wantTrailingSlash*/ false);
-}
-static bool cmdMvImpl(const char* cwd, const char* srcArg, const char* dstArg) {
-  if (!srcArg || !dstArg) return false;
-  char srcAbs[ActiveFS::MAX_NAME + 1];
-  if (!buildAbsFile(srcAbs, sizeof(srcAbs), cwd, srcArg)) {
-    Console.println("mv: invalid source path");
-    return false;
-  }
-  bool srcExists = activeFs.exists(srcAbs);
-  if (!srcExists) {
-    if (strstr(srcAbs, "//")) {
-      char alt[sizeof(srcAbs)];
-      strncpy(alt, srcAbs, sizeof(alt));
-      alt[sizeof(alt) - 1] = 0;
-      normalizePathInPlace(alt, /*wantTrailingSlash=*/false);
-      if (activeFs.exists(alt)) {
-        strncpy(srcAbs, alt, sizeof(srcAbs));
-        srcAbs[sizeof(srcAbs) - 1] = 0;
-        srcExists = true;
-      }
-    }
-  }
-  if (!srcExists) {
-    Console.println("mv: source not found");
-    return false;
-  }
-  uint32_t srcAddr = 0, srcSize = 0, srcCap = 0;
-  if (!activeFs.getFileInfo(srcAbs, srcAddr, srcSize, srcCap)) {
-    Console.println("mv: getFileInfo failed");
-    return false;
-  }
-  char dstAbs[ActiveFS::MAX_NAME + 1];
-  size_t Ldst = strlen(dstArg);
-  bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
-  if (dstIsFolder) {
-    char folderNoSlash[ActiveFS::MAX_NAME + 1];
-    if (!pathJoin(folderNoSlash, sizeof(folderNoSlash), cwd, dstArg, /*wantTrailingSlash*/ false)) {
-      Console.println("mv: destination folder path too long");
-      return false;
-    }
-    const char* base = lastSlash(srcAbs);
-    if (!makePathSafe(dstAbs, sizeof(dstAbs), folderNoSlash, base)) {
-      Console.println("mv: resulting path too long");
-      return false;
-    }
-  } else {
-    if (!buildAbsFile(dstAbs, sizeof(dstAbs), cwd, dstArg)) {
-      Console.println("mv: invalid destination path");
-      return false;
-    }
-  }
-  normalizePathInPlace(dstAbs, /*wantTrailingSlash=*/false);
-  if (strcmp(srcAbs, dstAbs) == 0) {
-    Console.println("mv: source and destination are the same");
-    return true;
-  }
-  if (pathTooLongForOnDisk(dstAbs)) {
-    Console.println("mv: destination name too long for FS (would be truncated)");
-    return false;
-  }
-  uint8_t* buf = (uint8_t*)malloc(srcSize ? srcSize : 1);
-  if (!buf) {
-    Console.println("mv: malloc failed");
-    return false;
-  }
-  uint32_t got = activeFs.readFile(srcAbs, buf, srcSize);
-  if (got != srcSize) {
-    Console.println("mv: read failed");
-    free(buf);
-    return false;
-  }
-  uint32_t eraseAlign = getEraseAlign();
-  uint32_t reserve = srcCap;
-  if (reserve < eraseAlign) {
-    uint32_t a = (srcSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
-    if (a > reserve) reserve = a;
-  }
-  if (reserve < eraseAlign) reserve = eraseAlign;
-  bool ok = false;
-  if (!activeFs.exists(dstAbs)) {
-    ok = activeFs.createFileSlot(dstAbs, reserve, buf, srcSize);
-  } else {
-    uint32_t dA, dS, dC;
-    if (!activeFs.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
-    if (dC >= srcSize) {
-      ok = activeFs.writeFileInPlace(dstAbs, buf, srcSize, false);
-    }
-    if (!ok) {
-      ok = activeFs.writeFile(dstAbs, buf, srcSize, fsReplaceMode());
-    }
-  }
-  if (!ok) {
-    Console.println("mv: write to destination failed");
-    free(buf);
-    return false;
-  }
-  if (!activeFs.deleteFile(srcAbs)) {
-    Console.println("mv: warning: source delete failed");
-  } else {
-    Console.println("mv: ok");
-  }
-  free(buf);
-  return true;
-}
-// ======== cp (copy) helper ========
-static bool cmdCpImpl(const char* cwd, const char* srcArg, const char* dstArg, bool force) {
-  if (!srcArg || !dstArg) return false;
-  char srcAbs[ActiveFS::MAX_NAME + 1];
-  if (!buildAbsFile(srcAbs, sizeof(srcAbs), cwd, srcArg)) {
-    Console.println("cp: invalid source path");
-    return false;
-  }
-  if (!activeFs.exists(srcAbs)) {
-    Console.println("cp: source not found");
-    return false;
-  }
-  uint32_t srcAddr = 0, srcSize = 0, srcCap = 0;
-  if (!activeFs.getFileInfo(srcAbs, srcAddr, srcSize, srcCap)) {
-    Console.println("cp: getFileInfo failed");
-    return false;
-  }
-  char dstAbs[ActiveFS::MAX_NAME + 1];
-  size_t Ldst = strlen(dstArg);
-  bool dstIsFolder = (Ldst > 0 && dstArg[Ldst - 1] == '/');
-  if (dstIsFolder) {
-    char folderNoSlash[ActiveFS::MAX_NAME + 1];
-    if (!pathJoin(folderNoSlash, sizeof(folderNoSlash), cwd, dstArg, /*wantTrailingSlash*/ false)) {
-      Console.println("cp: destination folder path too long");
-      return false;
-    }
-    const char* base = lastSlash(srcAbs);
-    if (!makePathSafe(dstAbs, sizeof(dstAbs), folderNoSlash, base)) {
-      Console.println("cp: resulting path too long");
-      return false;
-    }
-  } else {
-    if (!buildAbsFile(dstAbs, sizeof(dstAbs), cwd, dstArg)) {
-      Console.println("cp: invalid destination path");
-      return false;
-    }
-  }
-  normalizePathInPlace(dstAbs, /*wantTrailingSlash=*/false);
-  if (pathTooLongForOnDisk(dstAbs)) {
-    Console.println("cp: destination name too long for FS (would be truncated)");
-    return false;
-  }
-  // If destination exists and not forcing, refuse
-  if (activeFs.exists(dstAbs) && !force) {
-    Console.println("cp: destination exists (use -f to overwrite)");
-    return false;
-  }
-  // Read full source (consistent with mv behavior)
-  uint8_t* buf = (uint8_t*)malloc(srcSize ? srcSize : 1);
-  if (!buf) {
-    Console.println("cp: malloc failed");
-    return false;
-  }
-  uint32_t got = activeFs.readFile(srcAbs, buf, srcSize);
-  if (got != srcSize) {
-    Console.println("cp: read failed");
-    free(buf);
-    return false;
-  }
-  uint32_t eraseAlign = getEraseAlign();
-  uint32_t reserve = srcCap;
-  if (reserve < eraseAlign) {
-    uint32_t a = (srcSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
-    if (a > reserve) reserve = a;
-  }
-  if (reserve < eraseAlign) reserve = eraseAlign;
-  bool ok = false;
-  if (!activeFs.exists(dstAbs)) {
-    ok = activeFs.createFileSlot(dstAbs, reserve, buf, srcSize);
-  } else {
-    // overwrite existing
-    uint32_t dA, dS, dC;
-    if (!activeFs.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
-    if (dC >= srcSize) ok = activeFs.writeFileInPlace(dstAbs, buf, srcSize, false);
-    if (!ok) ok = activeFs.writeFile(dstAbs, buf, srcSize, fsReplaceMode());
-  }
-  free(buf);
-  if (!ok) {
-    Console.println("cp: write failed");
-    return false;
-  }
-  Console.println("cp: ok");
-  return true;
-}
 static void printPct2(uint32_t num, uint32_t den) {
   if (den == 0) {
     Console.print("n/a");
@@ -639,219 +125,6 @@ static void printPct2(uint32_t num, uint32_t den) {
   }
   uint32_t scaled = (uint32_t)(((uint64_t)num * 10000ULL + (den / 2)) / den);
   Console.printf("%lu.%02lu%%", (unsigned long)(scaled / 100), (unsigned long)(scaled % 100));
-}
-static uint32_t dirBytesUsedEstimate() {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (!dev) return 0;
-  constexpr uint32_t DIR_START = 0x000000;
-  constexpr uint32_t DIR_SIZE = 64 * 1024;
-  const uint32_t stride = dirEntryStride();
-  uint8_t rec[32];
-  uint32_t records = 0;
-  for (uint32_t off = 0; off + sizeof(rec) <= DIR_SIZE; off += stride) {
-    size_t got = dev->read(DIR_START + off, rec, sizeof(rec));
-    if (got != sizeof(rec)) break;
-    if (rec[0] == 0x57 && rec[1] == 0x46) {
-      records++;
-    }
-  }
-  return records * stride;
-}
-// ========== Minimal directory enumeration (reads the DIR table directly) ==========
-static inline uint32_t rd32_be(const uint8_t* p) {
-  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
-}
-static bool isAllFF(const uint8_t* p, size_t n) {
-  for (size_t i = 0; i < n; ++i)
-    if (p[i] != 0xFF) return false;
-  return true;
-}
-static size_t buildFsIndex(FsIndexEntry* out, size_t outMax) {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (!dev) return 0;
-  constexpr uint32_t DIR_START = 0x000000;
-  constexpr uint32_t DIR_SIZE = 64 * 1024;
-  const uint32_t stride = dirEntryStride();
-  FsIndexEntry map[64];
-  size_t mapCount = 0;
-  uint8_t rec[32];
-  for (uint32_t off = 0; off + sizeof(rec) <= DIR_SIZE; off += stride) {
-    if (dev->read(DIR_START + off, rec, sizeof(rec)) != sizeof(rec)) break;
-    if (rec[0] != 0x57 || rec[1] != 0x46) continue;
-    uint8_t flags = rec[2];
-    uint8_t nlen = rec[3];
-    if (nlen == 0 || nlen > ActiveFS::MAX_NAME) continue;
-    char name[ActiveFS::MAX_NAME + 1];
-    memset(name, 0, sizeof(name));
-    for (uint8_t i = 0; i < nlen; ++i) name[i] = (char)rec[4 + i];
-    uint32_t size = rd32_be(&rec[24]);
-    uint32_t seq = rd32_be(&rec[28]);
-    bool deleted = (flags & 0x01) != 0;
-    int idx = -1;
-    for (size_t i = 0; i < mapCount; ++i) {
-      if (strncmp(map[i].name, name, ActiveFS::MAX_NAME) == 0) {
-        idx = (int)i;
-        break;
-      }
-    }
-    if (idx < 0) {
-      if (mapCount >= 64) continue;
-      idx = (int)mapCount++;
-      strncpy(map[idx].name, name, ActiveFS::MAX_NAME);
-      map[idx].name[ActiveFS::MAX_NAME] = 0;
-      map[idx].seq = 0;
-    }
-    if (seq >= map[idx].seq) {
-      map[idx].seq = seq;
-      map[idx].deleted = deleted;
-      map[idx].size = size;
-    }
-  }
-  if (out && outMax) {
-    size_t n = (mapCount < outMax) ? mapCount : outMax;
-    for (size_t i = 0; i < n; ++i) out[i] = map[i];
-  }
-  return mapCount;
-}
-static bool hasPrefix(const char* name, const char* prefix) {
-  size_t lp = strlen(prefix);
-  return strncmp(name, prefix, lp) == 0;
-}
-static bool childOfFolder(const char* name, const char* folderPrefix, const char*& childOut) {
-  size_t lp = strlen(folderPrefix);
-  if (strncmp(name, folderPrefix, lp) != 0) return false;
-  const char* rest = name + lp;
-  if (*rest == 0) return false;
-  const char* slash = strchr(rest, '/');
-  if (slash) return false;
-  childOut = rest;
-  return true;
-}
-static void dumpDirHeadRaw(uint32_t bytes = 256) {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (!dev) {
-    Console.println("lsdebug: no device");
-    return;
-  }
-  if (bytes == 0 || bytes > 1024) bytes = 256;
-  uint8_t buf[1024];
-  size_t got = dev->read(0, buf, bytes);
-  Console.printf("lsdebug: read %u bytes @ 0x000000\n", (unsigned)got);
-  for (size_t i = 0; i < got; i += 16) {
-    Console.printf("  %04u: ", (unsigned)i);
-    for (size_t j = 0; j < 16 && (i + j) < got; ++j) {
-      uint8_t b = buf[i + j];
-      if (b < 16) Console.print('0');
-      Console.print(b, HEX);
-      Console.print(' ');
-    }
-    Console.println();
-  }
-}
-static void cmdDf() {
-  UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-  if (dev) {
-    const auto t = dev->type();
-    const char* style = UnifiedSpiMem::deviceTypeName(t);
-    const uint8_t cs = dev->cs();
-    const uint64_t devCap = dev->capacity();
-    const uint32_t dataStart = activeFs.dataRegionStart();
-    const uint32_t fsCap32 = activeFs.capacity();
-    const uint32_t dataCap = (fsCap32 > dataStart) ? (fsCap32 - dataStart) : 0;
-    const uint32_t dataUsed = (activeFs.nextDataAddr() > dataStart) ? (activeFs.nextDataAddr() - dataStart) : 0;
-    const uint32_t dataFree = (dataCap > dataUsed) ? (dataCap - dataUsed) : 0;
-    const uint32_t dirUsed = dirBytesUsedEstimate();
-    const uint32_t dirFree = (64u * 1024u > dirUsed) ? (64u * 1024u - dirUsed) : 0;
-    Console.println("Filesystem (active):");
-    Console.printf("  Device:  %s  CS=%u\n", style, (unsigned)cs);
-    Console.printf("  DevCap:  %llu bytes\n", (unsigned long long)devCap);
-    Console.printf("  FS data: %lu used (", (unsigned long)dataUsed);
-    printPct2(dataUsed, dataCap);
-    Console.printf(")  %lu free (", (unsigned long)dataFree);
-    printPct2(dataFree, dataCap);
-    Console.println(")");
-    Console.printf("  DIR:     %lu used (", (unsigned long)dirUsed);
-    printPct2(dirUsed, 64u * 1024u);
-    Console.printf(")  %lu free\n", (unsigned long)dirFree);
-  } else {
-    Console.println("Filesystem (active): none");
-  }
-  size_t n = uniMem.detectedCount();
-  if (n == 0) return;
-  Console.println("Detected devices:");
-  for (size_t i = 0; i < n; ++i) {
-    const auto* di = uniMem.detectedInfo(i);
-    if (!di) continue;
-    bool isActive = false;
-    UnifiedSpiMem::MemDevice* dev = activeFsDevice();
-    if (dev) {
-      isActive = (di->cs == dev->cs() && di->type == dev->type());
-    }
-    Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes%s\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes, isActive ? "\t <-- [mounted]" : "");
-  }
-}
-// ========== CWD + path helpers ==========
-static char g_cwd[ActiveFS::MAX_NAME + 1] = "";  // "" = root, printed as "/"
-static void pathStripTrailingSlashes(char* p) {
-  if (!p) return;
-  size_t n = strlen(p);
-  while (n > 0 && p[n - 1] == '/') { p[--n] = 0; }
-}
-static bool pathJoin(char* out, size_t outCap, const char* base, const char* name, bool wantTrailingSlash) {
-  if (!out || !name) return false;
-  if (name[0] == '/') {
-    const char* s = name + 1;
-    size_t L = strlen(s);
-    if (L > ActiveFS::MAX_NAME || L >= outCap) return false;
-    memcpy(out, s, L + 1);
-    if (wantTrailingSlash && L > 0 && out[L - 1] != '/') {
-      if (L + 1 > ActiveFS::MAX_NAME || L + 2 > outCap) return false;
-      out[L] = '/';
-      out[L + 1] = 0;
-    }
-    return true;
-  }
-  if (!base) base = "";
-  char tmp[ActiveFS::MAX_NAME + 1];
-  int need = 0;
-  if (base[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", name);
-  else if (name[0] == 0) need = snprintf(tmp, sizeof(tmp), "%s", base);
-  else need = snprintf(tmp, sizeof(tmp), "%s/%s", base, name);
-  if (need < 0 || (size_t)need > ActiveFS::MAX_NAME || (size_t)need >= sizeof(tmp)) return false;
-  size_t L = strlen(tmp);
-  if (wantTrailingSlash && L > 0 && tmp[L - 1] != '/') {
-    if (L + 1 > ActiveFS::MAX_NAME) return false;
-    tmp[L] = '/';
-    tmp[L + 1] = 0;
-  }
-  if (L >= outCap) return false;
-  memcpy(out, tmp, L + 1);
-  return true;
-}
-static void pathParent(char* p) {
-  if (!p) return;
-  pathStripTrailingSlashes(p);
-  size_t n = strlen(p);
-  if (n == 0) return;
-  char* last = strrchr(p, '/');
-  if (!last) {
-    p[0] = 0;
-  } else if (last == p) {
-    p[0] = 0;
-  } else {
-    *last = 0;
-  }
-}
-static bool isFolderMarkerName(const char* nm) {
-  size_t n = strlen(nm);
-  return (n > 0 && nm[n - 1] == '/');
-}
-static const char* firstSlash(const char* s) {
-  return strchr(s, '/');
-}
-static constexpr size_t FS_NAME_ONDISK_MAX = 32;  // match SimpleFS MAX_NAME
-static bool pathTooLongForOnDisk(const char* full) {
-  return strlen(full) > FS_NAME_ONDISK_MAX;
 }
 
 // ---- MIDI CLI helpers ----
@@ -1263,156 +536,11 @@ static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
   free(verify);
 }
 
-// =================== SHA-256 (public domain-style, compact) ===================
-static inline uint32_t SHR(uint32_t x, uint32_t n) {
-  return x >> n;
-}
-static inline uint32_t ROTR(uint32_t x, uint32_t n) {
-  return (x >> n) | (x << (32 - n));
-}
-static inline uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
-  return (x & y) ^ (~x & z);
-}
-static inline uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
-  return (x & y) ^ (x & z) ^ (y & z);
-}
-static inline uint32_t EP0(uint32_t x) {
-  return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22);
-}
-static inline uint32_t EP1(uint32_t x) {
-  return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25);
-}
-static inline uint32_t SIG0(uint32_t x) {
-  return ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3);
-}
-static inline uint32_t SIG1(uint32_t x) {
-  return ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10);
-}
-static const uint32_t k256[64] = {
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-};
-static void sha256_transform(SHA256_CTX* ctx, const uint8_t data[64]) {
-  uint32_t m[64];
-  for (int i = 0; i < 16; ++i) {
-    m[i] = (uint32_t)data[i * 4 + 0] << 24 | (uint32_t)data[i * 4 + 1] << 16 | (uint32_t)data[i * 4 + 2] << 8 | (uint32_t)data[i * 4 + 3];
-  }
-  for (int i = 16; i < 64; ++i)
-    m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
-
-  uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
-  uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
-
-  for (int i = 0; i < 64; ++i) {
-    uint32_t t1 = h + EP1(e) + Ch(e, f, g) + k256[i] + m[i];
-    uint32_t t2 = EP0(a) + Maj(a, b, c);
-    h = g;
-    g = f;
-    f = e;
-    e = d + t1;
-    d = c;
-    c = b;
-    b = a;
-    a = t1 + t2;
-  }
-
-  ctx->state[0] += a;
-  ctx->state[1] += b;
-  ctx->state[2] += c;
-  ctx->state[3] += d;
-  ctx->state[4] += e;
-  ctx->state[5] += f;
-  ctx->state[6] += g;
-  ctx->state[7] += h;
-}
-static void sha256_init(SHA256_CTX* ctx) {
-  ctx->datalen = 0;
-  ctx->bitlen = 0;
-  ctx->state[0] = 0x6a09e667;
-  ctx->state[1] = 0xbb67ae85;
-  ctx->state[2] = 0x3c6ef372;
-  ctx->state[3] = 0xa54ff53a;
-  ctx->state[4] = 0x510e527f;
-  ctx->state[5] = 0x9b05688c;
-  ctx->state[6] = 0x1f83d9ab;
-  ctx->state[7] = 0x5be0cd19;
-}
-static void sha256_update(SHA256_CTX* ctx, const uint8_t* data, size_t len) {
-  for (size_t i = 0; i < len; ++i) {
-    ctx->data[ctx->datalen++] = data[i];
-    if (ctx->datalen == 64) {
-      sha256_transform(ctx, ctx->data);
-      ctx->bitlen += 512;
-      ctx->datalen = 0;
-    }
-  }
-}
-static void sha256_final(SHA256_CTX* ctx, uint8_t hash[32]) {
-  uint32_t i = ctx->datalen;
-
-  // pad current block
-  ctx->data[i++] = 0x80;
-  if (i > 56) {
-    while (i < 64) ctx->data[i++] = 0;
-    sha256_transform(ctx, ctx->data);
-    i = 0;
-  }
-  while (i < 56) ctx->data[i++] = 0;
-
-  // append total bits, big-endian
-  ctx->bitlen += ctx->datalen * 8ull;
-  uint64_t bl = ctx->bitlen;
-  ctx->data[63] = (uint8_t)(bl);
-  ctx->data[62] = (uint8_t)(bl >> 8);
-  ctx->data[61] = (uint8_t)(bl >> 16);
-  ctx->data[60] = (uint8_t)(bl >> 24);
-  ctx->data[59] = (uint8_t)(bl >> 32);
-  ctx->data[58] = (uint8_t)(bl >> 40);
-  ctx->data[57] = (uint8_t)(bl >> 48);
-  ctx->data[56] = (uint8_t)(bl >> 56);
-  sha256_transform(ctx, ctx->data);
-
-  // output big-endian
-  for (int j = 0; j < 8; ++j) {
-    uint32_t s = ctx->state[j];
-    hash[j * 4 + 0] = (uint8_t)(s >> 24);
-    hash[j * 4 + 1] = (uint8_t)(s >> 16);
-    hash[j * 4 + 2] = (uint8_t)(s >> 8);
-    hash[j * 4 + 3] = (uint8_t)(s);
-  }
-}
-static bool sha256File(const char* fname, uint8_t out[32]) {
-  // Helper: compute SHA-256 of a file using readFileRange()
-  uint32_t sz = 0;
-  if (!activeFs.getFileSize(fname, sz)) {
-    Console.println("hash: not found");
-    return false;
-  }
-  const size_t CHUNK = 1024;
-  uint8_t buf[CHUNK];
-  SHA256_CTX ctx;
-  sha256_init(&ctx);
-
-  uint32_t off = 0;
-  while (off < sz) {
-    size_t n = (sz - off > CHUNK) ? CHUNK : (sz - off);
-    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
-    if (got != n) {
-      Console.println("hash: read error");
-      return false;
-    }
-    sha256_update(&ctx, buf, n);
-    off += n;
-    yield();
-  }
-  sha256_final(&ctx, out);
-  return true;
+static inline int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
 }
 static void printHexLower(const uint8_t* d, size_t n) {
   static const char* hexd = "0123456789abcdef";
@@ -1420,14 +548,6 @@ static void printHexLower(const uint8_t* d, size_t n) {
     Serial.write(hexd[d[i] >> 4]);
     Serial.write(hexd[d[i] & 0xF]);
   }
-}
-
-// ========== Binary upload helpers (single-line puthex/putb64) ==========
-static inline int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
 }
 static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
@@ -1440,13 +560,14 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
     return false;
   }
   uint32_t bytes = (uint32_t)(n / 2);
-  uint8_t* buf = (uint8_t*)malloc(bytes);
+  uint8_t* buf = (uint8_t*)malloc(bytes ? bytes : 1);
   if (!buf) {
     Console.println("puthex: malloc failed");
     return false;
   }
   for (uint32_t i = 0; i < bytes; ++i) {
-    int hi = hexVal(hex[2 * i + 0]), lo = hexVal(hex[2 * i + 1]);
+    int hi = hexVal(hex[2 * i + 0]);
+    int lo = hexVal(hex[2 * i + 1]);
     if (hi < 0 || lo < 0) {
       Console.println("puthex: invalid hex character");
       free(buf);
@@ -1458,22 +579,12 @@ static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
   outLen = bytes;
   return true;
 }
-static int8_t b64Map[256];
-static void initB64MapOnce() {
-  static bool inited = false;
-  if (inited) return;
-  for (int i = 0; i < 256; ++i) b64Map[i] = -1;
-  for (char c = 'A'; c <= 'Z'; ++c) b64Map[(uint8_t)c] = (int8_t)(c - 'A');
-  for (char c = 'a'; c <= 'z'; c++) b64Map[(uint8_t)c] = (int8_t)(26 + (c - 'a'));
-  for (char c = '0'; c <= '9'; c++) b64Map[(uint8_t)c] = (int8_t)(52 + (c - '0'));
-  b64Map[(uint8_t)'+'] = 62;
-  b64Map[(uint8_t)'/'] = 63;
-}
 static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   out = nullptr;
   outLen = 0;
   if (!s) return false;
-  initB64MapOnce();
+  shb64s::initMap();  // was initB64MapOnce()
+
   size_t inLen = strlen(s);
   uint32_t outCap = (uint32_t)(((inLen + 3) / 4) * 3);
   uint8_t* buf = (uint8_t*)malloc(outCap ? outCap : 1);
@@ -1485,6 +596,7 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
   int vals[4];
   int vCount = 0;
   int pad = 0;
+
   for (size_t i = 0; i < inLen; ++i) {
     unsigned char c = (unsigned char)s[i];
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
@@ -1492,7 +604,7 @@ static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
       vals[vCount++] = 0;
       pad++;
     } else {
-      int8_t v = b64Map[c];
+      int8_t v = shb64s::b64Map[c];  // was b64Map[c]
       if (v < 0) {
         Console.println("putb64: invalid base64 character");
         free(buf);
@@ -1537,319 +649,30 @@ static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len
   bool ok = activeFs.writeFile(fname, data, len, fsReplaceMode());
   return ok;
 }
-// ========== Streaming Base64 upload (clipboard-friendly, non-blocking, bracketed paste aware) ==========
-enum EscMode : uint8_t {
-  EM_None = 0,
-  EM_Esc,
-  EM_CSI,
-  EM_OSC,
-  EM_OSC_Esc
-};
-struct B64UploadState {
-  bool active = false;
-  char fname[ActiveFS::MAX_NAME + 1] = { 0 };
-
-  // Decoded data buffer (grow as needed; for really large files you could add chunked FS writes)
-  uint8_t* buf = nullptr;
-  uint32_t size = 0;
-  uint32_t cap = 0;
-  uint32_t expected = 0;
-
-  // Base64 quartet state
-  int8_t q[4];
-  uint8_t qn = 0;
-  uint8_t pad = 0;
-
-  // Line terminator detection (only when not in bracketed paste)
-  bool lineAtStart = true;
-  bool lineOnlyDot = true;
-  bool hadAnyData = false;
-
-  // Escape / terminal control parsing (non-blocking)
-  EscMode escMode = EM_None;
-  int csiNum = -1;              // parsed CSI numeric parameter (e.g., 200, 201)
-  bool bracketEnabled = false;  // we asked terminal to enable bracketed paste
-  bool bracketActive = false;   // we observed ESC[200~; will expect ESC[201~ to finish
-};
-static B64UploadState g_b64u;
-static bool b64uEnsure(uint32_t need) {
-  if (g_b64u.cap >= need) return true;
-  uint32_t newCap = g_b64u.cap ? g_b64u.cap : 4096;
-  while (newCap < need) {
-    uint32_t next = newCap * 2;
-    if (next <= newCap) {
-      newCap = need;
-      break;
-    }  // clamp on overflow
-    newCap = next;
-  }
-  uint8_t* nb = (uint8_t*)realloc(g_b64u.buf, newCap);
-  if (!nb) return false;
-  g_b64u.buf = nb;
-  g_b64u.cap = newCap;
-  return true;
-}
-static bool b64uEmit(uint8_t b) {
-  if (!b64uEnsure(g_b64u.size + 1)) return false;
-  g_b64u.buf[g_b64u.size++] = b;
-  return true;
-}
-static bool b64uEmit3(uint8_t b0, uint8_t b1, uint8_t b2, int emitCount) {
-  if (!b64uEnsure(g_b64u.size + (uint32_t)emitCount)) return false;
-  if (emitCount >= 1) g_b64u.buf[g_b64u.size++] = b0;
-  if (emitCount >= 2) g_b64u.buf[g_b64u.size++] = b1;
-  if (emitCount >= 3) g_b64u.buf[g_b64u.size++] = b2;
-  return true;
-}
-static bool b64uFlushQuartet(bool finalFlush, const char*& err) {
-  if (g_b64u.qn == 0) return true;
-  if (!finalFlush && g_b64u.qn < 4) return true;
-
-  if (finalFlush && (g_b64u.qn == 2 || g_b64u.qn == 3)) {
-    uint32_t v0 = (uint32_t)g_b64u.q[0], v1 = (uint32_t)g_b64u.q[1];
-    uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
-    if (g_b64u.qn == 2) {
-      g_b64u.qn = 0;
-      g_b64u.pad = 0;
-      return b64uEmit(b0) ? true : (err = "putb64s: OOM", false);
-    }
-    uint32_t v2 = (uint32_t)g_b64u.q[2];
-    uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
-    g_b64u.qn = 0;
-    g_b64u.pad = 0;
-    return b64uEmit3(b0, b1, 0, 2) ? true : (err = "putb64s: OOM", false);
-  }
-
-  if (g_b64u.qn != 4) {
-    err = "putb64s: truncated input";
+static bool sha256File(const char* fname, uint8_t out[32]) {
+  uint32_t sz = 0;
+  if (!activeFs.getFileSize(fname, sz)) {
+    Console.println("hash: not found");
     return false;
   }
-  uint32_t v0 = (uint32_t)g_b64u.q[0], v1 = (uint32_t)g_b64u.q[1];
-  uint32_t v2 = (uint32_t)g_b64u.q[2], v3 = (uint32_t)g_b64u.q[3];
-  uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
-  uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
-  uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
-  int emit = 3;
-  if (g_b64u.pad == 1) emit = 2;
-  else if (g_b64u.pad == 2) emit = 1;
-  else if (g_b64u.pad > 2) {
-    err = "putb64s: invalid padding";
-    return false;
+  shsha256::Ctx ctx;
+  shsha256::init(&ctx);
+  const size_t CHUNK = 1024;
+  uint8_t buf[CHUNK];
+  uint32_t off = 0;
+  while (off < sz) {
+    size_t n = (sz - off > CHUNK) ? CHUNK : (sz - off);
+    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
+    if (got != n) {
+      Console.println("hash: read error");
+      return false;
+    }
+    shsha256::update(&ctx, buf, n);
+    off += n;
+    yield();
   }
-  g_b64u.qn = 0;
-  g_b64u.pad = 0;
-  if (!b64uEmit3(b0, b1, b2, emit)) {
-    err = "putb64s: OOM";
-    return false;
-  }
+  shsha256::final(&ctx, out);
   return true;
-}
-static void b64uDisableBracketedPaste() {
-  if (g_b64u.bracketEnabled) {
-    // disable bracketed paste in terminal
-    Serial.print("\x1b[?2004l");
-    g_b64u.bracketEnabled = false;
-  }
-}
-static void b64uAbort(const char* why) {
-  b64uDisableBracketedPaste();
-  Console.print("putb64s: aborted: ");
-  Console.println(why ? why : "error");
-  if (g_b64u.buf) {
-    free(g_b64u.buf);
-    g_b64u.buf = nullptr;
-  }
-  g_b64u = B64UploadState{};
-  Console.print("> ");
-}
-static void b64uComplete() {
-  const char* err = nullptr;
-  if (!b64uFlushQuartet(/*final*/ true, err)) {
-    b64uAbort(err);
-    return;
-  }
-  b64uDisableBracketedPaste();
-  // Optional size check
-  if (g_b64u.expected && g_b64u.size != g_b64u.expected) {
-    Console.print("putb64s: warning: decoded ");
-    Console.print(g_b64u.size);
-    Console.print(" bytes, expected ");
-    Console.println(g_b64u.expected);
-  }
-  bool ok = writeBinaryToFS(g_b64u.fname, g_b64u.buf, g_b64u.size);
-  if (g_b64u.buf) {
-    free(g_b64u.buf);
-    g_b64u.buf = nullptr;
-  }
-  if (ok) {
-    Console.print("putb64s: wrote ");
-    Console.print(g_b64u.size);
-    Console.print(" bytes to ");
-    Console.println(g_b64u.fname);
-  } else {
-    Console.println("putb64s: write failed");
-  }
-  g_b64u = B64UploadState{};
-  Console.print("> ");
-}
-static void b64uStart(const char* fname, uint32_t expected) {
-  memset(&g_b64u, 0, sizeof(g_b64u));
-  g_b64u.active = true;
-  strncpy(g_b64u.fname, fname, ActiveFS::MAX_NAME);
-  g_b64u.fname[ActiveFS::MAX_NAME] = 0;
-  g_b64u.expected = expected;
-  if (expected) (void)b64uEnsure(expected);
-  initB64MapOnce();
-
-  // Enable bracketed paste so terminals wrap clipboard paste with ESC[200~ ... ESC[201~.
-  // This won’t affect simple serial monitors, but it helps modern terminals.
-  Serial.print("\x1b[?2004h");
-  g_b64u.bracketEnabled = true;
-
-  Console.println("putb64s: paste base64 now.");
-  Console.println(" - If your terminal supports bracketed paste, just paste; it will auto-detect end.");
-  Console.println(" - Otherwise, finish with Ctrl-D (EOT) or with a line containing only a single dot '.'");
-}
-static void b64uPump() {
-  // Non-blocking pump: consumes available bytes, handles bracketed paste, CSI/OSC, Ctrl-D, and '.' line
-  const char* err = nullptr;
-  while (Serial.available()) {
-    int iv = Serial.read();
-    if (iv < 0) break;
-    unsigned char c = (unsigned char)iv;
-
-    // Ctrl-D (EOT) always ends upload (works in many terminals)
-    if (c == 0x04) {
-      b64uComplete();
-      return;
-    }
-
-    // CR/LF for line handling only if not inside bracketed paste
-    if (!g_b64u.bracketActive) {
-      if (c == '\r') continue;
-      if (c == '\n') {
-        if (g_b64u.lineOnlyDot) {
-          // dot on its own line ends upload
-          b64uComplete();
-          return;
-        }
-        g_b64u.lineAtStart = true;
-        g_b64u.lineOnlyDot = true;
-        continue;
-      }
-    }
-
-    // Software flow control noise
-    if (c == 0x11 /*XON*/ || c == 0x13 /*XOFF*/) continue;
-
-    // Escape/terminal control parsing (non-blocking)
-    if (g_b64u.escMode != EM_None) {
-      // We are inside some escape handling
-      if (g_b64u.escMode == EM_Esc) {
-        if (c == '[') {
-          g_b64u.escMode = EM_CSI;
-          g_b64u.csiNum = -1;
-          continue;
-        }
-        if (c == ']') {
-          g_b64u.escMode = EM_OSC;
-          continue;
-        }
-        // Unknown ESC + X: ignore
-        g_b64u.escMode = EM_None;
-        continue;
-      } else if (g_b64u.escMode == EM_CSI) {
-        if (c >= '0' && c <= '9') {
-          if (g_b64u.csiNum < 0) g_b64u.csiNum = 0;
-          g_b64u.csiNum = g_b64u.csiNum * 10 + (c - '0');
-          continue;
-        }
-        if (c == '~') {
-          if (g_b64u.csiNum == 200) {
-            g_b64u.bracketActive = true;  // start-of-bracketed paste
-          } else if (g_b64u.csiNum == 201) {
-            // end-of-bracketed paste: complete immediately
-            b64uComplete();
-            return;
-          }
-          g_b64u.escMode = EM_None;
-          g_b64u.csiNum = -1;
-          continue;
-        }
-        // Any other final byte ends CSI
-        if (c >= 0x40 && c <= 0x7E) {
-          g_b64u.escMode = EM_None;
-          g_b64u.csiNum = -1;
-          continue;
-        }
-        // Else keep consuming CSI parameters
-        continue;
-      } else if (g_b64u.escMode == EM_OSC) {
-        if (c == 0x07) {
-          g_b64u.escMode = EM_None;
-          continue;
-        }  // BEL ends OSC
-        if (c == 0x1B) {
-          g_b64u.escMode = EM_OSC_Esc;
-          continue;
-        }          // ESC \ ends OSC
-        continue;  // swallow OSC content
-      } else if (g_b64u.escMode == EM_OSC_Esc) {
-        if (c == '\\') {
-          g_b64u.escMode = EM_None;
-          continue;
-        }  // ST = ESC \
-        g_b64u.escMode = EM_OSC;                                     // otherwise keep swallowing
-        continue;
-      }
-    } else {
-      if (c == 0x1B) {
-        g_b64u.escMode = EM_Esc;
-        continue;
-      }
-    }
-
-    // Only track dot-line termination when not in bracketed paste
-    if (!g_b64u.bracketActive) {
-      if (g_b64u.lineAtStart) {
-        if (c == '.') {
-          // keep lineOnlyDot = true unless other non-space follows
-        } else if (c != ' ' && c != '\t') {
-          g_b64u.lineOnlyDot = false;
-        }
-        g_b64u.lineAtStart = false;
-      } else {
-        if (c != ' ' && c != '\t') g_b64u.lineOnlyDot = false;
-      }
-    }
-
-    // Ignore whitespace (safe for both wrapped and unwrapped base64)
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-
-    // Base64
-    if (c == '=') {
-      if (g_b64u.qn >= 4) {
-        b64uAbort("putb64s: quartet overflow");
-        return;
-      }
-      g_b64u.q[g_b64u.qn++] = 0;
-      g_b64u.pad++;
-    } else {
-      int8_t v = b64Map[c];
-      if (v < 0) {
-        // Ignore any other non-base64 glyphs (robust against stray terminal noise)
-        continue;
-      }
-      g_b64u.q[g_b64u.qn++] = v;
-    }
-    if (g_b64u.qn == 4) {
-      if (!b64uFlushQuartet(/*final*/ false, err)) {
-        b64uAbort(err);
-        return;
-      }
-      g_b64u.hadAnyData = true;
-    }
-  }
 }
 
 // ================== Improved Console Line Editing with History (single-row, horizontal scroll) ==================
@@ -2272,210 +1095,6 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   free(outBuf);
   free(srcBuf);
   return ok;
-}
-
-// ================== Cross-filesystem copy (fscp) ==================
-static void fillFsIface(StorageBackend b, FSIface& out) {
-  if (b == StorageBackend::Flash) {
-    out.mount = [](bool autoFmt) {
-      return fsFlash.mount(autoFmt);
-    };
-    out.exists = [](const char* n) {
-      return fsFlash.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsFlash.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsFlash.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsFlash.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsFlash.getFileInfo(n, a, s, c);
-    };
-  } else if (b == StorageBackend::NAND) {
-    out.mount = [](bool autoFmt) {
-      return fsNAND.mount(autoFmt);
-    };
-    out.exists = [](const char* n) {
-      return fsNAND.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsNAND.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsNAND.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsNAND.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsNAND.getFileInfo(n, a, s, c);
-    };
-  } else {
-    out.mount = [](bool autoFmt) {
-      (void)autoFmt;
-      return fsPSRAM.mount(false);
-    };
-    out.exists = [](const char* n) {
-      return fsPSRAM.exists(n);
-    };
-    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
-      return fsPSRAM.createFileSlot(n, r, d, s);
-    };
-    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
-      return fsPSRAM.writeFile(n, d, s, m);
-    };
-    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
-      return fsPSRAM.writeFileInPlace(n, d, s, a);
-    };
-    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
-      return fsPSRAM.readFile(n, b, sz);
-    };
-    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
-      return fsPSRAM.getFileInfo(n, a, s, c);
-    };
-  }
-}
-static bool parseBackendSpec(const char* spec, StorageBackend& outBackend, const char*& outPath) {
-  if (!spec) return false;
-  const char* colon = strchr(spec, ':');
-  if (!colon) return false;
-  size_t nameLen = (size_t)(colon - spec);
-  if (nameLen == 0) return false;
-  if (strncmp(spec, "flash", nameLen) == 0) outBackend = StorageBackend::Flash;
-  else if (strncmp(spec, "psram", nameLen) == 0) outBackend = StorageBackend::PSRAM_BACKEND;
-  else if (strncmp(spec, "nand", nameLen) == 0) outBackend = StorageBackend::NAND;
-  else return false;
-  outPath = colon + 1;  // may start with '/' or not
-  return true;
-}
-static bool normalizeFsPathCopy(char* dst, size_t dstCap, const char* input, bool wantTrailingSlash) {
-  if (!dst || !input) return false;
-  // Copy without leading '/'
-  const char* s = input;
-  while (*s == '/') ++s;
-  size_t L = strlen(s);
-  if (L >= dstCap) return false;
-  memcpy(dst, s, L + 1);
-  normalizePathInPlace(dst, wantTrailingSlash);
-  if (strlen(dst) > ActiveFS::MAX_NAME) return false;
-  return true;
-}
-static bool cmdFsCpImpl(const char* srcSpec, const char* dstSpec, bool force) {
-  StorageBackend sbSrc, sbDst;
-  const char* srcPathIn = nullptr;
-  const char* dstPathIn = nullptr;
-  if (!parseBackendSpec(srcSpec, sbSrc, srcPathIn) || !parseBackendSpec(dstSpec, sbDst, dstPathIn)) {
-    Console.println("fscp: invalid backend spec; use flash:/path psram:/path nand:/path");
-    return false;
-  }
-  // Prepare FS interfaces and mount (idempotent)
-  FSIface srcFS{}, dstFS{};
-  fillFsIface(sbSrc, srcFS);
-  fillFsIface(sbDst, dstFS);
-  // Mount: auto-format when empty on Flash/NAND; PSRAM no auto-format
-  bool srcMounted = srcFS.mount((sbSrc != StorageBackend::PSRAM_BACKEND));
-  bool dstMounted = dstFS.mount((sbDst != StorageBackend::PSRAM_BACKEND));
-  if (!srcMounted) {
-    Console.println("fscp: source mount failed");
-    return false;
-  }
-  if (!dstMounted) {
-    Console.println("fscp: destination mount failed");
-    return false;
-  }
-  // Normalize paths within 32-char limit
-  char srcAbs[ActiveFS::MAX_NAME + 1];
-  char dstArgRaw[ActiveFS::MAX_NAME + 1];
-  if (!normalizeFsPathCopy(srcAbs, sizeof(srcAbs), srcPathIn, /*wantTrailingSlash*/ false)) {
-    Console.println("fscp: source path too long (<=32)");
-    return false;
-  }
-  // Determine if destination is a folder spec (trailing '/')
-  size_t LdstIn = strlen(dstPathIn);
-  bool dstAsFolder = (LdstIn > 0 && dstPathIn[LdstIn - 1] == '/');
-  if (!normalizeFsPathCopy(dstArgRaw, sizeof(dstArgRaw), dstPathIn, dstAsFolder)) {
-    Console.println("fscp: destination path too long (<=32)");
-    return false;
-  }
-  // Source exists and info
-  if (!srcFS.exists(srcAbs)) {
-    Console.println("fscp: source not found");
-    return false;
-  }
-  uint32_t sAddr = 0, sSize = 0, sCap = 0;
-  if (!srcFS.getFileInfo(srcAbs, sAddr, sSize, sCap)) {
-    Console.println("fscp: getFileInfo(source) failed");
-    return false;
-  }
-  // Build destination absolute
-  char dstAbs[ActiveFS::MAX_NAME + 1];
-  if (dstAsFolder) {
-    const char* base = lastSlash(srcAbs);
-    if (!makePathSafe(dstAbs, sizeof(dstAbs), dstArgRaw, base)) {
-      Console.println("fscp: resulting destination path too long");
-      return false;
-    }
-  } else {
-    // already normalized as file
-    strncpy(dstAbs, dstArgRaw, sizeof(dstAbs));
-    dstAbs[sizeof(dstAbs) - 1] = 0;
-  }
-  if (pathTooLongForOnDisk(dstAbs)) {
-    Console.println("fscp: destination name too long for FS (would be truncated)");
-    return false;
-  }
-  // Overwrite policy
-  if (dstFS.exists(dstAbs) && !force) {
-    Console.println("fscp: destination exists (use -f to overwrite)");
-    return false;
-  }
-  // Read source fully (consistent with local cp)
-  uint8_t* buf = (uint8_t*)malloc(sSize ? sSize : 1);
-  if (!buf) {
-    Console.println("fscp: malloc failed");
-    return false;
-  }
-  uint32_t got = srcFS.readFile(srcAbs, buf, sSize);
-  if (got != sSize) {
-    Console.println("fscp: read failed");
-    free(buf);
-    return false;
-  }
-  // Reserve/erase alignment based on destination backend
-  uint32_t eraseAlign = getEraseAlignFor(sbDst);
-  uint32_t reserve = sCap;
-  if (reserve < eraseAlign) {
-    uint32_t a = (sSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
-    if (a > reserve) reserve = a;
-  }
-  if (reserve < eraseAlign) reserve = eraseAlign;
-
-  bool ok = false;
-  if (!dstFS.exists(dstAbs)) {
-    ok = dstFS.createFileSlot(dstAbs, reserve, buf, sSize);
-  } else {
-    uint32_t dA, dS, dC;
-    if (!dstFS.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
-    if (dC >= sSize) ok = dstFS.writeFileInPlace(dstAbs, buf, sSize, false);
-    if (!ok) ok = dstFS.writeFile(dstAbs, buf, sSize, fsReplaceModeFor(sbDst));
-  }
-  free(buf);
-  if (!ok) {
-    Console.println("fscp: write failed");
-    return false;
-  }
-  Console.println("fscp: ok");
-  return true;
 }
 
 // ========== Serial console / command handling ==========
@@ -2971,12 +1590,13 @@ static void handleCommand(char* line) {
     if (!checkNameLen(fn)) return;
     uint32_t expected = 0;
     if (nextToken(p, opt)) expected = (uint32_t)strtoul(opt, nullptr, 0);
-    if (g_b64u.active) {
+    if (shb64s::active(g_b64)) {
       Console.println("putb64s: another upload is active");
       return;
     }
-    b64uStart(fn, expected);
-    return;  // loop() will pump until upload completes
+    // Begin streaming upload; shb64 interacts with Serial directly, like your old code
+    shb64s::begin(g_b64, Serial, fn, expected, writeBinaryToFS);
+    return;  // loop() will pump until completion
   } else if (!strcmp(t0, "hash") || !strcmp(t0, "sha256")) {
     char* fn;
     char* algo = nullptr;
@@ -3515,6 +2135,8 @@ void setup() {
   if (!nandOk) Console.println("NAND FS: no suitable device found or open failed");
   if (!flashOk) Console.println("Flash FS: no suitable device found or open failed");
   if (!psramOk) Console.println("PSRAM FS: no suitable device found or open failed");
+  shfs_bindDevices(&fsFlash, &fsPSRAM, &fsNAND, &uniMem);
+  shfs_setPrint(&Console);  // optional
   bindActiveFs(g_storage);
   bool mounted = activeFs.mount(g_storage == StorageBackend::Flash /*autoFormatIfEmpty*/);
   if (!mounted) {
@@ -3576,8 +2198,8 @@ void loop1() {
   tight_loop_contents();
 }
 void loop() {
-  if (g_b64u.active) {
-    b64uPump();
+  if (shb64s::active(g_b64)) {
+    shb64s::pump(g_b64);
     return;
   }
   if (readLine()) {
