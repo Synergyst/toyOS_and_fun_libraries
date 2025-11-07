@@ -114,7 +114,6 @@ struct NanoEditor {
         if (p < sizeof(buf) - 1) buf[p++] = (char)ch;
         if (ch == 'R') break;
       } else {
-        Exec.pollBackground();
         tight_loop_contents();
         yield();
       }
@@ -605,7 +604,6 @@ struct NanoEditor {
           // Try to parse CSI or SS3 or simple Alt combos
           uint32_t tstart = millis();
           while (!Serial.available() && (millis() - tstart) < 200) {
-            Exec.pollBackground();
             tight_loop_contents();
             yield();
           }
@@ -620,7 +618,6 @@ struct NanoEditor {
             for (;;) {
               uint32_t ts = millis();
               while (!Serial.available() && (millis() - ts) < 200) {
-                Exec.pollBackground();
                 tight_loop_contents();
                 yield();
               }
@@ -662,7 +659,6 @@ struct NanoEditor {
             // SS3 sequences: 'H' Home, 'F' End on some terms
             uint32_t ts = millis();
             while (!Serial.available() && (millis() - ts) < 200) {
-              Exec.pollBackground();
               tight_loop_contents();
               yield();
             }
@@ -679,7 +675,6 @@ struct NanoEditor {
         }
         return ch;
       }
-      Exec.pollBackground();
       tight_loop_contents();
       yield();
     }

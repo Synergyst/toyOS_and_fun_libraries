@@ -720,10 +720,12 @@ private:
 
 // --------------------------- Unified facade (scan + list + reservation) ---------------------------
 namespace UnifiedSpiMem {
-enum class DeviceType : uint8_t { Unknown = 0,
-                                  NorW25Q,
-                                  SpiNandMX35,
-                                  Psram };
+enum class DeviceType : uint8_t {
+  Unknown = 0,
+  NorW25Q,
+  SpiNandMX35,
+  Psram
+};
 struct DeviceInfo {
   DeviceType type = DeviceType::Unknown;
   uint8_t cs = 0xFF;

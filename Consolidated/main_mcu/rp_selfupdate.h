@@ -17,35 +17,27 @@
     #define RPUPD_FS_FLASH_TARGET_OFFSET   0x00000000u
     #define RPUPD_FS_ONBOARD_FLASH_SIZE    (2u * 1024u * 1024u)  // adjust to your board
 */
-
 #ifndef ARDUINO_ARCH_RP2040
 #if !defined(PICO_RP2040) && !defined(PICO_RP2350)
 #error "This header targets RP2040/RP2350 (Arduino-Pico) only."
 #endif
 #endif
-
 #include <Arduino.h>
-
 extern "C" {
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 #include <hardware/watchdog.h>
 #include <pico/bootrom.h>
 }
-
 #ifndef RPUPD_FS_FLASH_TARGET_OFFSET
 #define RPUPD_FS_FLASH_TARGET_OFFSET 0x00000000u
 #endif
-
 #ifndef RPUPD_FS_ONBOARD_FLASH_SIZE
 #define RPUPD_FS_ONBOARD_FLASH_SIZE (2u * 1024u * 1024u)
 #endif
-
 static constexpr size_t RPUPD_FS_SECTOR = 4096;
 static constexpr size_t RPUPD_FS_PAGE = 256;
-
 static uint8_t rpupdfs_sector_buf[RPUPD_FS_SECTOR];
-
 // Connect internal flash where applicable (RP2350 PICO_NO_FLASH)
 static inline void rpupdfs_connect_internal_flash_if_needed() {
 #if defined(PICO_RP2350) && defined(PICO_NO_FLASH) && PICO_NO_FLASH
@@ -55,16 +47,14 @@ static inline void rpupdfs_connect_internal_flash_if_needed() {
   __compiler_memory_barrier();
 #endif
 }
-
-// RAM-resident critical: erase+program one 4KB sector from given RAM buffer
 static bool __not_in_flash_func(rpupdfs_erase_program_sector_ram)(uint32_t dst_offset, const uint8_t* buf4k) {
+  // RAM-resident critical: erase+program one 4KB sector from given RAM buffer
   flash_range_erase(dst_offset, RPUPD_FS_SECTOR);
   for (size_t off = 0; off < RPUPD_FS_SECTOR; off += RPUPD_FS_PAGE) {
     flash_range_program(dst_offset + off, buf4k + off, RPUPD_FS_PAGE);
   }
   return true;
 }
-
 // Public: program internal flash from a file in your PSRAM FS.
 // - fs: your PSRAMSimpleFS_Generic (or compatible) instance
 // - filename: file containing the raw RP binary
@@ -73,10 +63,7 @@ static bool __not_in_flash_func(rpupdfs_erase_program_sector_ram)(uint32_t dst_o
 //
 // Returns true on success. No metadata: writes exactly the file bytes.
 template<typename FS>
-static inline bool rpupdfs_program_from_file(FS& fs,
-                                             const char* filename,
-                                             bool reboot_after = true,
-                                             uint32_t flash_offset = RPUPD_FS_FLASH_TARGET_OFFSET) {
+static inline bool rpupdfs_program_from_file(FS& fs, const char* filename, bool reboot_after = true, uint32_t flash_offset = RPUPD_FS_FLASH_TARGET_OFFSET) {
   if (!filename || !filename[0]) return false;
 
   // Query file size
@@ -117,21 +104,18 @@ static inline bool rpupdfs_program_from_file(FS& fs,
   }
   return true;
 }
-
 // Optional convenience: format directory region (preserves chip content except DIR area)
 template<typename FS>
 static inline bool rpupdfs_format(FS& fs) {
   return fs.format();
 }
-
 // Optional convenience: full-chip wipe to 0xFF (slow)
 template<typename FS>
 static inline bool rpupdfs_wipe_chip(FS& fs) {
   return fs.wipeChip();
 }
-
-// Toy brick function: erase first 4KB of internal flash (forces BOOTSEL recovery)
 static inline void rpupdfs_corrupt_first_sector_and_reboot() {
+  // Toy brick function: erase first 4KB of internal flash (forces BOOTSEL recovery)
   const uint32_t irq = save_and_disable_interrupts();
   flash_range_erase(0x00000000u, RPUPD_FS_SECTOR);
   restore_interrupts(irq);
@@ -139,9 +123,8 @@ static inline void rpupdfs_corrupt_first_sector_and_reboot() {
   watchdog_reboot(0, 0, 0);
   while (true) {}
 }
-
-// Optional: enter BootROM UF2 mode programmatically
 static inline void rpupdfs_enter_bootsel_now() {
+  // Optional: enter BootROM UF2 mode programmatically
   reset_usb_boot(0, 0);
   while (true) {}
 }

@@ -1,7 +1,8 @@
-// main_psram_flash_switch_exec_loader.ino
+// main_mcu.ino
 #define COPROCLANG_COPY_INPUT 1
 // ------- Shared HW SPI (FLASH + PSRAM) -------
 #include "ConsolePrint.h"
+static ConsolePrint Console;  // Console wrapper
 // Force low identification speed compatible with the bridge
 //#define UNIFIED_SPI_INSTANCE SPI1
 #define UNIFIED_SPI_INSTANCE SPI
@@ -9,22 +10,8 @@
 #define W25Q_SPI_CLOCK_HZ 104000000UL     // 104 MHz NOR
 #define MX35_SPI_CLOCK_HZ 104000000UL     // 104 MHz NAND
 #include "UnifiedSPIMemSimpleFS.h"
-// ------- Co-Processor over Software Serial (framed RPC) -------
-#include <SoftwareSerial.h>
-#include "CoProcProto.h"
-#include "CoProcLang.h"
-#ifndef COPROC_BAUD
-//#define COPROC_BAUD 230400
-//#define COPROC_BAUD 115200
-#define COPROC_BAUD 57600
-#endif
-#ifndef PIN_COPROC_RX
-#define PIN_COPROC_RX 0  // GP0 (main RX)
-#endif
-#ifndef PIN_COPROC_TX
-#define PIN_COPROC_TX 1  // GP1 (main TX)
-#endif
-static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, TX, non-inverted
+// ------- Custom scripting language interpreter -------
+#include "LangInter.h"
 // Store ASCII scripts as raw multi-line strings, expose pointer + length.
 #ifndef DECLARE_ASCII_SCRIPT
 #define DECLARE_ASCII_SCRIPT(name, literal) \
@@ -32,22 +19,10 @@ static SoftwareSerial coprocLink(PIN_COPROC_RX, PIN_COPROC_TX, false);  // RX, T
   const uint8_t* name = reinterpret_cast<const uint8_t*>(name##_ascii); \
   const unsigned int name##_len = (unsigned int)(sizeof(name##_ascii) - 1)
 #endif
-struct BlobReg;               // Forward declaration
-static ConsolePrint Console;  // Console wrapper
+struct BlobReg;  // Forward declaration
 // ------- MC Compiiler -------
 #include "MCCompiler.h"
 // ------- User preference configuration -------
-#include "blob_mailbox_config.h"  // Do not remove this line. This is the memory address where we handle the shared interprocess-mailbox-buffer
-#include "blob_ret42.h"
-#define FILE_RET42 "ret42"
-#include "blob_add2.h"
-#define FILE_ADD2 "add2"
-#include "blob_pwmc.h"
-#define FILE_PWMC "pwmc"
-#include "blob_pwmc2350.h"
-#define FILE_PWMC2350 "pwmc2350"
-#include "blob_retmin.h"
-#define FILE_RETMIN "retmin"
 #include "blob_dont.h"
 #define FILE_DONT "dont"
 #include "scripts.h"
@@ -107,6 +82,12 @@ W25QUnifiedSimpleFS fsFlash;
 PSRAMUnifiedSimpleFS fsPSRAM;
 MX35UnifiedSimpleFS fsNAND;
 static bool g_dev_mode = true;
+struct SHA256_CTX {
+  uint32_t state[8];
+  uint64_t bitlen;
+  uint8_t data[64];
+  uint32_t datalen;
+};
 // ========== ActiveFS structure ==========
 struct ActiveFS {
   bool (*mount)(bool) = nullptr;
@@ -935,11 +916,6 @@ struct BlobReg {
   unsigned int len;
 };
 static const BlobReg g_blobs[] = {
-  { FILE_RET42, blob_ret42, blob_ret42_len },
-  { FILE_ADD2, blob_add2, blob_add2_len },
-  { FILE_PWMC, blob_pwmc, blob_pwmc_len },
-  { FILE_PWMC2350, blob_pwmc2350, blob_pwmc2350_len },
-  { FILE_RETMIN, blob_retmin, blob_retmin_len },
   { FILE_DONT, blob_dont, blob_dont_len },
   { FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len },
   { FILE_ONSCRIPT, blob_onscript, blob_onscript_len },
@@ -949,37 +925,1559 @@ static const BlobReg g_blobs[] = {
   { FILE_PT3, blob_pt3, blob_pt3_len },
 };
 static const size_t g_blobs_count = sizeof(g_blobs) / sizeof(g_blobs[0]);
-// ========== Return mailbox reservation (Scratch) ==========
-extern "C" __scratch_x("blob_mailbox") __attribute__((aligned(4)))
-int8_t BLOB_MAILBOX[BLOB_MAILBOX_MAX] = { 0 };
-// ================= ExecHost header =================
-#include "ExecHost.h"
-static ExecHost Exec;
-// ================= FSHelpers header =================
-static void updateExecFsTable() {
-  ExecFSTable t{};
-  t.exists = activeFs.exists;
-  t.getFileSize = activeFs.getFileSize;
-  t.readFile = activeFs.readFile;
-  t.readFileRange = activeFs.readFileRange;
-  t.createFileSlot = activeFs.createFileSlot;
-  t.writeFile = activeFs.writeFile;
-  t.writeFileInPlace = activeFs.writeFileInPlace;
-  t.getFileInfo = activeFs.getFileInfo;
-  //t.deleteFile = activeFs.deleteFile;
-  Exec.attachFS(t);
+
+// ================= Memory Diagnostics =================
+#ifdef ARDUINO_ARCH_RP2040
+extern "C" {
+  extern char __StackTop;
+  extern char __StackBottom;
 }
-#include "MemDiag.h"
-#include "BlobGen.h"
-#include "PSRAMDiag.h"
-#include "CoProcRPCHelpers.h"
-#include "NanoishTextEditor.h"
-#include "SHA256hashcmd.h"
-#include "Base64Utils.h"
-#include "InputHelper.h"
-#include "CrossFSUtils.h"
-#include "CompilerHelpers.h"
-#include "ZModem.h"
+#include "unistd.h"
+static uint32_t freeStackCurrentCoreApprox() {
+  volatile uint8_t marker;
+  uintptr_t sp = (uintptr_t)&marker;
+  uintptr_t top = (uintptr_t)&__StackTop;
+  uintptr_t bottom = (uintptr_t)&__StackBottom;
+  if (top > bottom && sp >= bottom && sp <= top) {
+    return (uint32_t)(sp - bottom);
+  }
+  void* heapEnd = sbrk(0);
+  intptr_t gap = (intptr_t)sp - (intptr_t)heapEnd;
+  return (gap > 0) ? (uint32_t)gap : 0u;
+}
+#else
+static uint32_t freeStackCurrentCoreApprox() {
+  volatile uint8_t marker;
+  void* heapEnd = sbrk(0);
+  intptr_t gap = (intptr_t)&marker - (intptr_t)heapEnd;
+  return (gap > 0) ? (uint32_t)gap : 0u;
+}
+#endif
+#ifdef ARDUINO_ARCH_RP2040
+static void printStackInfo() {
+  volatile uint8_t marker;
+  uintptr_t sp = (uintptr_t)&marker;
+  uintptr_t top = (uintptr_t)&__StackTop;
+  uintptr_t bottom = (uintptr_t)&__StackBottom;
+  if (top > bottom && sp >= bottom && sp <= top) {
+    uint32_t total = (uint32_t)(top - bottom);
+    uint32_t used = (uint32_t)(top - sp);
+    uint32_t free = (uint32_t)(sp - bottom);
+    Console.printf("Stack total=%u used=%u free=%u bytes\n", total, used, free);
+    return;
+  }
+  Console.printf("Free Stack (core0 approx): %u bytes\n", freeStackCurrentCoreApprox());
+}
+#endif
+
+// ========== FS helpers and console ==========
+static bool checkNameLen(const char* name) {
+  size_t n = strlen(name);
+  if (n == 0 || n > ActiveFS::MAX_NAME) {
+    Console.print("Error: filename length ");
+    Console.print(n);
+    Console.print(" exceeds max ");
+    Console.print(ActiveFS::MAX_NAME);
+    Console.println(". Use a shorter name.");
+    return false;
+  }
+  return true;
+}
+static void listBlobs() {
+  Console.println("Available blobs:");
+  for (size_t i = 0; i < g_blobs_count; ++i) {
+    Console.printf(" - %s  \t(%d bytes)\n", g_blobs[i].id, g_blobs[i].len);
+  }
+}
+static const BlobReg* findBlob(const char* id) {
+  for (size_t i = 0; i < g_blobs_count; ++i)
+    if (strcmp(g_blobs[i].id, id) == 0) return &g_blobs[i];
+  return nullptr;
+}
+static void dumpFileHead(const char* fname, uint32_t count) {
+  uint32_t sz = 0;
+  if (!activeFs.getFileSize(fname, sz) || sz == 0) {
+    Console.println("dump: missing/empty");
+    return;
+  }
+  if (count > sz) count = sz;
+  const size_t CHUNK = 32;
+  uint8_t buf[CHUNK];
+  uint32_t off = 0;
+  Console.print(fname);
+  Console.print(" size=");
+  Console.println(sz);
+  while (off < count) {
+    size_t n = (count - off > CHUNK) ? CHUNK : (count - off);
+    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
+    if (got != n) {
+      Console.println("  read error");
+      break;
+    }
+    Console.print("  ");
+    for (size_t i = 0; i < n; ++i) {
+      if (i) Console.print(' ');
+      if (buf[i] < 0x10) Console.print('0');
+      Console.print(buf[i], HEX);
+    }
+    Console.println();
+    off += n;
+  }
+}
+static bool ensureBlobFile(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
+  if (!checkNameLen(fname)) return false;
+  uint32_t eraseAlign = getEraseAlign();
+  if (reserve < eraseAlign) reserve = eraseAlign;
+  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
+  if (!activeFs.exists(fname)) {
+    Console.print("Creating slot ");
+    Console.print(fname);
+    Console.print(" (");
+    Console.print(reserve);
+    Console.println(" bytes)...");
+    if (activeFs.createFileSlot(fname, reserve, data, len)) {
+      Console.println("Created and wrote blob");
+      return true;
+    }
+    Console.println("Failed to create slot");
+    return false;
+  }
+  uint32_t addr, size, cap;
+  if (!activeFs.getFileInfo(fname, addr, size, cap)) {
+    Console.println("getFileInfo failed");
+    return false;
+  }
+  bool same = (size == len);
+  if (same) {
+    const size_t CHUNK = 64;
+    uint8_t buf[CHUNK];
+    uint32_t off = 0;
+    while (off < size) {
+      size_t n = (size - off > CHUNK) ? CHUNK : (size - off);
+      activeFs.readFileRange(fname, off, buf, n);
+      for (size_t i = 0; i < n; ++i) {
+        if (buf[i] != data[off + i]) {
+          same = false;
+          break;
+        }
+      }
+      if (!same) break;
+      off += n;
+      yield();
+    }
+  }
+  if (same) {
+    Console.println("Blob already up to date");
+    return true;
+  }
+  if (cap >= len && activeFs.writeFileInPlace(fname, data, len, false)) {
+    Console.println("Updated in place");
+    return true;
+  }
+  if (activeFs.writeFile(fname, data, len, fsReplaceMode())) {
+    Console.println("Updated by allocating new space");
+    return true;
+  }
+  Console.println("Failed to update file");
+  return false;
+}
+static bool ensureBlobIfMissing(const char* fname, const uint8_t* data, uint32_t len, uint32_t reserve = ActiveFS::SECTOR_SIZE) {
+  if (!checkNameLen(fname)) return false;
+  if (activeFs.exists(fname)) {
+    Console.printf("Skipping: %s\n", fname);
+    return true;
+  }
+  uint32_t eraseAlign = getEraseAlign();
+  if (reserve < eraseAlign) reserve = eraseAlign;
+  reserve = (len ? ((len + (eraseAlign - 1)) & ~(eraseAlign - 1)) : reserve);
+  Console.printf("Auto-creating %s (%lu bytes)...\n", fname, (unsigned long)reserve);
+  if (activeFs.createFileSlot(fname, reserve, data, len)) {
+    Console.println("Created and wrote blob");
+    return true;
+  }
+  Console.println("Auto-create failed");
+  return false;
+}
+static void autogenBlobWrites() {
+  bool allOk = true;
+  allOk &= ensureBlobIfMissing(FILE_DONT, blob_dont, blob_dont_len);
+  allOk &= ensureBlobIfMissing(FILE_BLINKSCRIPT, blob_blinkscript, blob_blinkscript_len);
+  allOk &= ensureBlobIfMissing(FILE_ONSCRIPT, blob_onscript, blob_onscript_len);
+  allOk &= ensureBlobIfMissing(FILE_SONG, blob_song, blob_song_len);
+  allOk &= ensureBlobIfMissing(FILE_PT1, blob_pt1, blob_pt1_len);
+  allOk &= ensureBlobIfMissing(FILE_PT2, blob_pt2, blob_pt2_len);
+  allOk &= ensureBlobIfMissing(FILE_PT3, blob_pt3, blob_pt3_len);
+  Console.print("Autogen:  ");
+  Console.println(allOk ? "OK" : "some failures");
+}
+
+// ========== PSRAM diagnostics using UnifiedSPIMem ==========
+static void psramPrintCapacityReport(UnifiedSpiMem::Manager& mgr, Stream& out = Serial) {
+  size_t banks = 0;
+  uint64_t total = 0;
+  out.println();
+  out.println("PSRAM capacity report (Unified):");
+  for (size_t i = 0; i < mgr.detectedCount(); ++i) {
+    const auto* di = mgr.detectedInfo(i);
+    if (!di || di->type != UnifiedSpiMem::DeviceType::Psram) continue;
+    banks++;
+    total += di->capacityBytes;
+    out.print("  Bank ");
+    out.print(banks - 1);
+    out.print(" (CS=");
+    out.print(di->cs);
+    out.print(")  Vendor=");
+    out.print(di->vendorName);
+    out.print("  Cap=");
+    out.print((unsigned long)di->capacityBytes);
+    out.print(" bytes");
+    if (di->partHint) {
+      out.print("  Part=");
+      out.print(di->partHint);
+    }
+    out.print("  JEDEC:");
+    for (uint8_t k = 0; k < di->jedecLen; ++k) {
+      out.print(' ');
+      if (di->jedec[k] < 16) out.print('0');
+      out.print(di->jedec[k], HEX);
+    }
+    out.println();
+  }
+  out.print("Banks: ");
+  out.println((unsigned)banks);
+  out.print("Total: ");
+  out.print((unsigned long)total);
+  out.print(" bytes (");
+  out.print((unsigned long)(total / (1024UL * 1024UL)));
+  out.println(" MB)");
+  out.println();
+}
+static void psramSafeSmokeTest(PSRAMUnifiedSimpleFS& fs, Stream& out = Serial) {
+  auto* dev = fs.raw().device();
+  if (!dev || dev->type() != UnifiedSpiMem::DeviceType::Psram) {
+    out.println("PSRAM smoke test: PSRAM device not open");
+    return;
+  }
+  const uint64_t cap = dev->capacity();
+  if (cap < 1024) {
+    out.println("PSRAM smoke test: capacity too small");
+    return;
+  }
+  const uint32_t fsHead = fs.raw().nextDataAddr();
+  const uint32_t dataStart = fs.raw().dataRegionStart();
+  const uint32_t TEST_SIZE = 1024;
+  uint64_t testAddr = fsHead + 4096;
+  if (testAddr + TEST_SIZE > cap) {
+    if (cap > TEST_SIZE) testAddr = cap - TEST_SIZE;
+    else testAddr = 0;
+  }
+  testAddr = (testAddr + 0xFF) & ~0xFFull;
+  if (testAddr < dataStart) testAddr = dataStart;
+  out.print("PSRAM smoke test @ 0x");
+  out.print((unsigned long)testAddr, HEX);
+  out.print(" size=");
+  out.print(TEST_SIZE);
+  out.println(" bytes");
+  uint8_t* original = (uint8_t*)malloc(TEST_SIZE);
+  uint8_t* verify = (uint8_t*)malloc(TEST_SIZE);
+  if (!original || !verify) {
+    out.println("malloc failed for buffers");
+    if (original) free(original);
+    if (verify) free(verify);
+    return;
+  }
+  if (dev->read(testAddr, original, TEST_SIZE) != TEST_SIZE) {
+    out.println("read (backup) failed");
+    free(original);
+    free(verify);
+    return;
+  }
+  memset(verify, 0xAA, TEST_SIZE);
+  if (!dev->write(testAddr, verify, TEST_SIZE)) {
+    out.println("write pattern 0xAA failed");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  memset(verify, 0x00, TEST_SIZE);
+  if (dev->read(testAddr, verify, TEST_SIZE) != TEST_SIZE) {
+    out.println("readback (0xAA) failed");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  bool okAA = true;
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    if (verify[i] != 0xAA) {
+      okAA = false;
+      break;
+    }
+    if ((i & 63) == 0) yield();
+  }
+  out.println(okAA ? "Pattern 0xAA OK" : "Pattern 0xAA mismatch");
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    verify[i] = (uint8_t)((testAddr + i) ^ 0x5A);
+  }
+  if (!dev->write(testAddr, verify, TEST_SIZE)) {
+    out.println("write pattern addr^0x5A failed");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  uint8_t* rb = (uint8_t*)malloc(TEST_SIZE);
+  if (!rb) {
+    out.println("malloc failed for readback");
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  if (dev->read(testAddr, rb, TEST_SIZE) != TEST_SIZE) {
+    out.println("readback (addr^0x5A) failed");
+    free(rb);
+    (void)dev->write(testAddr, original, TEST_SIZE);
+    free(original);
+    free(verify);
+    return;
+  }
+  bool okAddr = true;
+  for (uint32_t i = 0; i < TEST_SIZE; ++i) {
+    uint8_t exp = (uint8_t)((testAddr + i) ^ 0x5A);
+    if (rb[i] != exp) {
+      okAddr = false;
+      break;
+    }
+    if ((i & 63) == 0) yield();
+  }
+  out.println(okAddr ? "Pattern addr^0x5A OK" : "Pattern addr^0x5A mismatch");
+  free(rb);
+  if (!dev->write(testAddr, original, TEST_SIZE)) {
+    out.println("restore failed (data left with test pattern)");
+  } else {
+    out.println("restore OK");
+  }
+  free(original);
+  free(verify);
+}
+
+// =================== SHA-256 (public domain-style, compact) ===================
+static inline uint32_t SHR(uint32_t x, uint32_t n) {
+  return x >> n;
+}
+static inline uint32_t ROTR(uint32_t x, uint32_t n) {
+  return (x >> n) | (x << (32 - n));
+}
+static inline uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
+  return (x & y) ^ (~x & z);
+}
+static inline uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
+  return (x & y) ^ (x & z) ^ (y & z);
+}
+static inline uint32_t EP0(uint32_t x) {
+  return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22);
+}
+static inline uint32_t EP1(uint32_t x) {
+  return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25);
+}
+static inline uint32_t SIG0(uint32_t x) {
+  return ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3);
+}
+static inline uint32_t SIG1(uint32_t x) {
+  return ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10);
+}
+static const uint32_t k256[64] = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+static void sha256_transform(SHA256_CTX* ctx, const uint8_t data[64]) {
+  uint32_t m[64];
+  for (int i = 0; i < 16; ++i) {
+    m[i] = (uint32_t)data[i * 4 + 0] << 24 | (uint32_t)data[i * 4 + 1] << 16 | (uint32_t)data[i * 4 + 2] << 8 | (uint32_t)data[i * 4 + 3];
+  }
+  for (int i = 16; i < 64; ++i)
+    m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+
+  uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
+  uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
+
+  for (int i = 0; i < 64; ++i) {
+    uint32_t t1 = h + EP1(e) + Ch(e, f, g) + k256[i] + m[i];
+    uint32_t t2 = EP0(a) + Maj(a, b, c);
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+
+  ctx->state[0] += a;
+  ctx->state[1] += b;
+  ctx->state[2] += c;
+  ctx->state[3] += d;
+  ctx->state[4] += e;
+  ctx->state[5] += f;
+  ctx->state[6] += g;
+  ctx->state[7] += h;
+}
+static void sha256_init(SHA256_CTX* ctx) {
+  ctx->datalen = 0;
+  ctx->bitlen = 0;
+  ctx->state[0] = 0x6a09e667;
+  ctx->state[1] = 0xbb67ae85;
+  ctx->state[2] = 0x3c6ef372;
+  ctx->state[3] = 0xa54ff53a;
+  ctx->state[4] = 0x510e527f;
+  ctx->state[5] = 0x9b05688c;
+  ctx->state[6] = 0x1f83d9ab;
+  ctx->state[7] = 0x5be0cd19;
+}
+static void sha256_update(SHA256_CTX* ctx, const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    ctx->data[ctx->datalen++] = data[i];
+    if (ctx->datalen == 64) {
+      sha256_transform(ctx, ctx->data);
+      ctx->bitlen += 512;
+      ctx->datalen = 0;
+    }
+  }
+}
+static void sha256_final(SHA256_CTX* ctx, uint8_t hash[32]) {
+  uint32_t i = ctx->datalen;
+
+  // pad current block
+  ctx->data[i++] = 0x80;
+  if (i > 56) {
+    while (i < 64) ctx->data[i++] = 0;
+    sha256_transform(ctx, ctx->data);
+    i = 0;
+  }
+  while (i < 56) ctx->data[i++] = 0;
+
+  // append total bits, big-endian
+  ctx->bitlen += ctx->datalen * 8ull;
+  uint64_t bl = ctx->bitlen;
+  ctx->data[63] = (uint8_t)(bl);
+  ctx->data[62] = (uint8_t)(bl >> 8);
+  ctx->data[61] = (uint8_t)(bl >> 16);
+  ctx->data[60] = (uint8_t)(bl >> 24);
+  ctx->data[59] = (uint8_t)(bl >> 32);
+  ctx->data[58] = (uint8_t)(bl >> 40);
+  ctx->data[57] = (uint8_t)(bl >> 48);
+  ctx->data[56] = (uint8_t)(bl >> 56);
+  sha256_transform(ctx, ctx->data);
+
+  // output big-endian
+  for (int j = 0; j < 8; ++j) {
+    uint32_t s = ctx->state[j];
+    hash[j * 4 + 0] = (uint8_t)(s >> 24);
+    hash[j * 4 + 1] = (uint8_t)(s >> 16);
+    hash[j * 4 + 2] = (uint8_t)(s >> 8);
+    hash[j * 4 + 3] = (uint8_t)(s);
+  }
+}
+static bool sha256File(const char* fname, uint8_t out[32]) {
+  // Helper: compute SHA-256 of a file using readFileRange()
+  uint32_t sz = 0;
+  if (!activeFs.getFileSize(fname, sz)) {
+    Console.println("hash: not found");
+    return false;
+  }
+  const size_t CHUNK = 1024;
+  uint8_t buf[CHUNK];
+  SHA256_CTX ctx;
+  sha256_init(&ctx);
+
+  uint32_t off = 0;
+  while (off < sz) {
+    size_t n = (sz - off > CHUNK) ? CHUNK : (sz - off);
+    uint32_t got = activeFs.readFileRange(fname, off, buf, n);
+    if (got != n) {
+      Console.println("hash: read error");
+      return false;
+    }
+    sha256_update(&ctx, buf, n);
+    off += n;
+    yield();
+  }
+  sha256_final(&ctx, out);
+  return true;
+}
+static void printHexLower(const uint8_t* d, size_t n) {
+  static const char* hexd = "0123456789abcdef";
+  for (size_t i = 0; i < n; ++i) {
+    Serial.write(hexd[d[i] >> 4]);
+    Serial.write(hexd[d[i] & 0xF]);
+  }
+}
+
+// ========== Binary upload helpers (single-line puthex/putb64) ==========
+static inline int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static bool decodeHexString(const char* hex, uint8_t*& out, uint32_t& outLen) {
+  out = nullptr;
+  outLen = 0;
+  if (!hex) return false;
+  size_t n = strlen(hex);
+  if (n == 0) return false;
+  if (n & 1) {
+    Console.println("puthex: error: hex string length is odd");
+    return false;
+  }
+  uint32_t bytes = (uint32_t)(n / 2);
+  uint8_t* buf = (uint8_t*)malloc(bytes);
+  if (!buf) {
+    Console.println("puthex: malloc failed");
+    return false;
+  }
+  for (uint32_t i = 0; i < bytes; ++i) {
+    int hi = hexVal(hex[2 * i + 0]), lo = hexVal(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) {
+      Console.println("puthex: invalid hex character");
+      free(buf);
+      return false;
+    }
+    buf[i] = (uint8_t)((hi << 4) | lo);
+  }
+  out = buf;
+  outLen = bytes;
+  return true;
+}
+static int8_t b64Map[256];
+static void initB64MapOnce() {
+  static bool inited = false;
+  if (inited) return;
+  for (int i = 0; i < 256; ++i) b64Map[i] = -1;
+  for (char c = 'A'; c <= 'Z'; ++c) b64Map[(uint8_t)c] = (int8_t)(c - 'A');
+  for (char c = 'a'; c <= 'z'; c++) b64Map[(uint8_t)c] = (int8_t)(26 + (c - 'a'));
+  for (char c = '0'; c <= '9'; c++) b64Map[(uint8_t)c] = (int8_t)(52 + (c - '0'));
+  b64Map[(uint8_t)'+'] = 62;
+  b64Map[(uint8_t)'/'] = 63;
+}
+static bool decodeBase64String(const char* s, uint8_t*& out, uint32_t& outLen) {
+  out = nullptr;
+  outLen = 0;
+  if (!s) return false;
+  initB64MapOnce();
+  size_t inLen = strlen(s);
+  uint32_t outCap = (uint32_t)(((inLen + 3) / 4) * 3);
+  uint8_t* buf = (uint8_t*)malloc(outCap ? outCap : 1);
+  if (!buf) {
+    Console.println("putb64: malloc failed");
+    return false;
+  }
+  uint32_t o = 0;
+  int vals[4];
+  int vCount = 0;
+  int pad = 0;
+  for (size_t i = 0; i < inLen; ++i) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+    if (c == '=') {
+      vals[vCount++] = 0;
+      pad++;
+    } else {
+      int8_t v = b64Map[c];
+      if (v < 0) {
+        Console.println("putb64: invalid base64 character");
+        free(buf);
+        return false;
+      }
+      vals[vCount++] = v;
+    }
+    if (vCount == 4) {
+      uint32_t v0 = (uint32_t)vals[0], v1 = (uint32_t)vals[1], v2 = (uint32_t)vals[2], v3 = (uint32_t)vals[3];
+      uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
+      uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
+      uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
+      if (pad == 0) {
+        buf[o++] = b0;
+        buf[o++] = b1;
+        buf[o++] = b2;
+      } else if (pad == 1) {
+        buf[o++] = b0;
+        buf[o++] = b1;
+      } else if (pad == 2) {
+        buf[o++] = b0;
+      } else {
+        free(buf);
+        Console.println("putb64: invalid padding");
+        return false;
+      }
+      vCount = 0;
+      pad = 0;
+    }
+  }
+  if (vCount != 0) {
+    free(buf);
+    Console.println("putb64: truncated input");
+    return false;
+  }
+  out = buf;
+  outLen = o;
+  return true;
+}
+static bool writeBinaryToFS(const char* fname, const uint8_t* data, uint32_t len) {
+  if (!checkNameLen(fname)) return false;
+  bool ok = activeFs.writeFile(fname, data, len, fsReplaceMode());
+  return ok;
+}
+// ========== Streaming Base64 upload (clipboard-friendly, non-blocking, bracketed paste aware) ==========
+enum EscMode : uint8_t {
+  EM_None = 0,
+  EM_Esc,
+  EM_CSI,
+  EM_OSC,
+  EM_OSC_Esc
+};
+struct B64UploadState {
+  bool active = false;
+  char fname[ActiveFS::MAX_NAME + 1] = { 0 };
+
+  // Decoded data buffer (grow as needed; for really large files you could add chunked FS writes)
+  uint8_t* buf = nullptr;
+  uint32_t size = 0;
+  uint32_t cap = 0;
+  uint32_t expected = 0;
+
+  // Base64 quartet state
+  int8_t q[4];
+  uint8_t qn = 0;
+  uint8_t pad = 0;
+
+  // Line terminator detection (only when not in bracketed paste)
+  bool lineAtStart = true;
+  bool lineOnlyDot = true;
+  bool hadAnyData = false;
+
+  // Escape / terminal control parsing (non-blocking)
+  EscMode escMode = EM_None;
+  int csiNum = -1;              // parsed CSI numeric parameter (e.g., 200, 201)
+  bool bracketEnabled = false;  // we asked terminal to enable bracketed paste
+  bool bracketActive = false;   // we observed ESC[200~; will expect ESC[201~ to finish
+};
+static B64UploadState g_b64u;
+static bool b64uEnsure(uint32_t need) {
+  if (g_b64u.cap >= need) return true;
+  uint32_t newCap = g_b64u.cap ? g_b64u.cap : 4096;
+  while (newCap < need) {
+    uint32_t next = newCap * 2;
+    if (next <= newCap) {
+      newCap = need;
+      break;
+    }  // clamp on overflow
+    newCap = next;
+  }
+  uint8_t* nb = (uint8_t*)realloc(g_b64u.buf, newCap);
+  if (!nb) return false;
+  g_b64u.buf = nb;
+  g_b64u.cap = newCap;
+  return true;
+}
+static bool b64uEmit(uint8_t b) {
+  if (!b64uEnsure(g_b64u.size + 1)) return false;
+  g_b64u.buf[g_b64u.size++] = b;
+  return true;
+}
+static bool b64uEmit3(uint8_t b0, uint8_t b1, uint8_t b2, int emitCount) {
+  if (!b64uEnsure(g_b64u.size + (uint32_t)emitCount)) return false;
+  if (emitCount >= 1) g_b64u.buf[g_b64u.size++] = b0;
+  if (emitCount >= 2) g_b64u.buf[g_b64u.size++] = b1;
+  if (emitCount >= 3) g_b64u.buf[g_b64u.size++] = b2;
+  return true;
+}
+static bool b64uFlushQuartet(bool finalFlush, const char*& err) {
+  if (g_b64u.qn == 0) return true;
+  if (!finalFlush && g_b64u.qn < 4) return true;
+
+  if (finalFlush && (g_b64u.qn == 2 || g_b64u.qn == 3)) {
+    uint32_t v0 = (uint32_t)g_b64u.q[0], v1 = (uint32_t)g_b64u.q[1];
+    uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
+    if (g_b64u.qn == 2) {
+      g_b64u.qn = 0;
+      g_b64u.pad = 0;
+      return b64uEmit(b0) ? true : (err = "putb64s: OOM", false);
+    }
+    uint32_t v2 = (uint32_t)g_b64u.q[2];
+    uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
+    g_b64u.qn = 0;
+    g_b64u.pad = 0;
+    return b64uEmit3(b0, b1, 0, 2) ? true : (err = "putb64s: OOM", false);
+  }
+
+  if (g_b64u.qn != 4) {
+    err = "putb64s: truncated input";
+    return false;
+  }
+  uint32_t v0 = (uint32_t)g_b64u.q[0], v1 = (uint32_t)g_b64u.q[1];
+  uint32_t v2 = (uint32_t)g_b64u.q[2], v3 = (uint32_t)g_b64u.q[3];
+  uint8_t b0 = (uint8_t)((v0 << 2) | (v1 >> 4));
+  uint8_t b1 = (uint8_t)(((v1 & 0x0F) << 4) | (v2 >> 2));
+  uint8_t b2 = (uint8_t)(((v2 & 0x03) << 6) | v3);
+  int emit = 3;
+  if (g_b64u.pad == 1) emit = 2;
+  else if (g_b64u.pad == 2) emit = 1;
+  else if (g_b64u.pad > 2) {
+    err = "putb64s: invalid padding";
+    return false;
+  }
+  g_b64u.qn = 0;
+  g_b64u.pad = 0;
+  if (!b64uEmit3(b0, b1, b2, emit)) {
+    err = "putb64s: OOM";
+    return false;
+  }
+  return true;
+}
+static void b64uDisableBracketedPaste() {
+  if (g_b64u.bracketEnabled) {
+    // disable bracketed paste in terminal
+    Serial.print("\x1b[?2004l");
+    g_b64u.bracketEnabled = false;
+  }
+}
+static void b64uAbort(const char* why) {
+  b64uDisableBracketedPaste();
+  Console.print("putb64s: aborted: ");
+  Console.println(why ? why : "error");
+  if (g_b64u.buf) {
+    free(g_b64u.buf);
+    g_b64u.buf = nullptr;
+  }
+  g_b64u = B64UploadState{};
+  Console.print("> ");
+}
+static void b64uComplete() {
+  const char* err = nullptr;
+  if (!b64uFlushQuartet(/*final*/ true, err)) {
+    b64uAbort(err);
+    return;
+  }
+  b64uDisableBracketedPaste();
+  // Optional size check
+  if (g_b64u.expected && g_b64u.size != g_b64u.expected) {
+    Console.print("putb64s: warning: decoded ");
+    Console.print(g_b64u.size);
+    Console.print(" bytes, expected ");
+    Console.println(g_b64u.expected);
+  }
+  bool ok = writeBinaryToFS(g_b64u.fname, g_b64u.buf, g_b64u.size);
+  if (g_b64u.buf) {
+    free(g_b64u.buf);
+    g_b64u.buf = nullptr;
+  }
+  if (ok) {
+    Console.print("putb64s: wrote ");
+    Console.print(g_b64u.size);
+    Console.print(" bytes to ");
+    Console.println(g_b64u.fname);
+  } else {
+    Console.println("putb64s: write failed");
+  }
+  g_b64u = B64UploadState{};
+  Console.print("> ");
+}
+static void b64uStart(const char* fname, uint32_t expected) {
+  memset(&g_b64u, 0, sizeof(g_b64u));
+  g_b64u.active = true;
+  strncpy(g_b64u.fname, fname, ActiveFS::MAX_NAME);
+  g_b64u.fname[ActiveFS::MAX_NAME] = 0;
+  g_b64u.expected = expected;
+  if (expected) (void)b64uEnsure(expected);
+  initB64MapOnce();
+
+  // Enable bracketed paste so terminals wrap clipboard paste with ESC[200~ ... ESC[201~.
+  // This won’t affect simple serial monitors, but it helps modern terminals.
+  Serial.print("\x1b[?2004h");
+  g_b64u.bracketEnabled = true;
+
+  Console.println("putb64s: paste base64 now.");
+  Console.println(" - If your terminal supports bracketed paste, just paste; it will auto-detect end.");
+  Console.println(" - Otherwise, finish with Ctrl-D (EOT) or with a line containing only a single dot '.'");
+}
+static void b64uPump() {
+  // Non-blocking pump: consumes available bytes, handles bracketed paste, CSI/OSC, Ctrl-D, and '.' line
+  const char* err = nullptr;
+  while (Serial.available()) {
+    int iv = Serial.read();
+    if (iv < 0) break;
+    unsigned char c = (unsigned char)iv;
+
+    // Ctrl-D (EOT) always ends upload (works in many terminals)
+    if (c == 0x04) {
+      b64uComplete();
+      return;
+    }
+
+    // CR/LF for line handling only if not inside bracketed paste
+    if (!g_b64u.bracketActive) {
+      if (c == '\r') continue;
+      if (c == '\n') {
+        if (g_b64u.lineOnlyDot) {
+          // dot on its own line ends upload
+          b64uComplete();
+          return;
+        }
+        g_b64u.lineAtStart = true;
+        g_b64u.lineOnlyDot = true;
+        continue;
+      }
+    }
+
+    // Software flow control noise
+    if (c == 0x11 /*XON*/ || c == 0x13 /*XOFF*/) continue;
+
+    // Escape/terminal control parsing (non-blocking)
+    if (g_b64u.escMode != EM_None) {
+      // We are inside some escape handling
+      if (g_b64u.escMode == EM_Esc) {
+        if (c == '[') {
+          g_b64u.escMode = EM_CSI;
+          g_b64u.csiNum = -1;
+          continue;
+        }
+        if (c == ']') {
+          g_b64u.escMode = EM_OSC;
+          continue;
+        }
+        // Unknown ESC + X: ignore
+        g_b64u.escMode = EM_None;
+        continue;
+      } else if (g_b64u.escMode == EM_CSI) {
+        if (c >= '0' && c <= '9') {
+          if (g_b64u.csiNum < 0) g_b64u.csiNum = 0;
+          g_b64u.csiNum = g_b64u.csiNum * 10 + (c - '0');
+          continue;
+        }
+        if (c == '~') {
+          if (g_b64u.csiNum == 200) {
+            g_b64u.bracketActive = true;  // start-of-bracketed paste
+          } else if (g_b64u.csiNum == 201) {
+            // end-of-bracketed paste: complete immediately
+            b64uComplete();
+            return;
+          }
+          g_b64u.escMode = EM_None;
+          g_b64u.csiNum = -1;
+          continue;
+        }
+        // Any other final byte ends CSI
+        if (c >= 0x40 && c <= 0x7E) {
+          g_b64u.escMode = EM_None;
+          g_b64u.csiNum = -1;
+          continue;
+        }
+        // Else keep consuming CSI parameters
+        continue;
+      } else if (g_b64u.escMode == EM_OSC) {
+        if (c == 0x07) {
+          g_b64u.escMode = EM_None;
+          continue;
+        }  // BEL ends OSC
+        if (c == 0x1B) {
+          g_b64u.escMode = EM_OSC_Esc;
+          continue;
+        }          // ESC \ ends OSC
+        continue;  // swallow OSC content
+      } else if (g_b64u.escMode == EM_OSC_Esc) {
+        if (c == '\\') {
+          g_b64u.escMode = EM_None;
+          continue;
+        }  // ST = ESC \
+        g_b64u.escMode = EM_OSC;                                     // otherwise keep swallowing
+        continue;
+      }
+    } else {
+      if (c == 0x1B) {
+        g_b64u.escMode = EM_Esc;
+        continue;
+      }
+    }
+
+    // Only track dot-line termination when not in bracketed paste
+    if (!g_b64u.bracketActive) {
+      if (g_b64u.lineAtStart) {
+        if (c == '.') {
+          // keep lineOnlyDot = true unless other non-space follows
+        } else if (c != ' ' && c != '\t') {
+          g_b64u.lineOnlyDot = false;
+        }
+        g_b64u.lineAtStart = false;
+      } else {
+        if (c != ' ' && c != '\t') g_b64u.lineOnlyDot = false;
+      }
+    }
+
+    // Ignore whitespace (safe for both wrapped and unwrapped base64)
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+
+    // Base64
+    if (c == '=') {
+      if (g_b64u.qn >= 4) {
+        b64uAbort("putb64s: quartet overflow");
+        return;
+      }
+      g_b64u.q[g_b64u.qn++] = 0;
+      g_b64u.pad++;
+    } else {
+      int8_t v = b64Map[c];
+      if (v < 0) {
+        // Ignore any other non-base64 glyphs (robust against stray terminal noise)
+        continue;
+      }
+      g_b64u.q[g_b64u.qn++] = v;
+    }
+    if (g_b64u.qn == 4) {
+      if (!b64uFlushQuartet(/*final*/ false, err)) {
+        b64uAbort(err);
+        return;
+      }
+      g_b64u.hadAnyData = true;
+    }
+  }
+}
+
+// ================== Improved Console Line Editing with History (single-row, horizontal scroll) ==================
+static const char* PROMPT = "> ";
+static char lineBuf[FS_SECTOR_SIZE];  // Input buffer (keep the existing large buffer, but we cap usable length to history capacity)
+// History (SRAM only)
+#define HISTORY_MAX 16
+#define HISTORY_ENTRY_MAX 192
+static char g_history[HISTORY_MAX][HISTORY_ENTRY_MAX];
+static int g_history_count = 0;                        // number of valid entries
+static int g_history_browse = -1;                      // -1 = not browsing; 0 = newest; increases as we go up
+static char g_saved_before_browse[HISTORY_ENTRY_MAX];  // buffer to restore when exiting browse
+static size_t g_saved_before_browse_len = 0;
+// Terminal width handling and single-line viewport
+static size_t g_term_cols = 80;  // default, configurable via 'termwidth' command
+static size_t g_view_start = 0;  // first byte index in lineBuf that is visible
+// Renderer/editor state
+static size_t g_line_len = 0;
+static size_t g_cursor = 0;
+static size_t g_last_render_len = 0;
+static inline size_t promptLen() {
+  return strlen(PROMPT);
+}
+static inline size_t maxLineLen() {
+  return sizeof(lineBuf) - 1;  // 4095 with your FS_SECTOR_SIZE=4096
+}
+static inline size_t visibleCols() {
+  // visible columns for content (prompt consumes some columns)
+  size_t p = promptLen();
+  if (g_term_cols <= p + 8) return 16;  // fallback if terminal is tiny or unknown
+  size_t v = g_term_cols - p;
+  if (v < 8) v = 8;
+  return v;
+}
+static void historyPush(const char* s, size_t len) {
+  if (!s || len == 0) return;
+  // Avoid duplicate of last entry
+  if (g_history_count > 0) {
+    const char* last = g_history[g_history_count - 1];
+    if (strncmp(last, s, HISTORY_ENTRY_MAX - 1) == 0 && strlen(last) == len) return;
+  }
+  if (g_history_count < HISTORY_MAX) {
+    // append
+    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
+    memcpy(g_history[g_history_count], s, L);
+    g_history[g_history_count][L] = 0;
+    g_history_count++;
+  } else {
+    // shift left
+    for (int i = 1; i < HISTORY_MAX; ++i) {
+      strncpy(g_history[i - 1], g_history[i], HISTORY_ENTRY_MAX);
+      g_history[i - 1][HISTORY_ENTRY_MAX - 1] = 0;
+    }
+    size_t L = (len < (HISTORY_ENTRY_MAX - 1)) ? len : (HISTORY_ENTRY_MAX - 1);
+    memcpy(g_history[HISTORY_MAX - 1], s, L);
+    g_history[HISTORY_MAX - 1][L] = 0;
+  }
+}
+static void adjustViewToCursor() {
+  size_t vcols = visibleCols();
+  // Ensure cursor is within [g_view_start, g_view_start + vcols - 1]
+  if (g_cursor < g_view_start) {
+    g_view_start = g_cursor;
+  } else if (g_cursor >= g_view_start + vcols) {
+    g_view_start = g_cursor - (vcols - 1);
+  }
+  // If the tail got shorter, try to bring view back left so we don’t leave lots of empty cols
+  size_t maxStart = (g_line_len > vcols) ? (g_line_len - vcols) : 0;
+  if (g_view_start > maxStart) g_view_start = maxStart;
+}
+static void renderLine() {
+  adjustViewToCursor();
+
+  // Clear current row and repaint compact window
+  Serial.print("\r\x1b[2K");  // CR + clear entire line
+  Serial.print(PROMPT);
+
+  size_t vcols = visibleCols();
+  if (g_line_len > 0) {
+    size_t visLen = (g_line_len > g_view_start) ? (g_line_len - g_view_start) : 0;
+    if (visLen > vcols) visLen = vcols;
+    if (visLen) Serial.write(lineBuf + g_view_start, visLen);
+  }
+
+  // Place cursor at logical position within the single row
+  size_t col = promptLen() + (g_cursor - g_view_start);
+  Serial.print("\r\x1b[");
+  Serial.print((unsigned)col);
+  Serial.print('C');
+
+  g_last_render_len = g_line_len;
+}
+static void setLineFrom(const char* s) {
+  if (!s) s = "";
+  size_t L = strlen(s);
+  if (L > maxLineLen()) L = maxLineLen();
+  memcpy(lineBuf, s, L);
+  g_line_len = L;
+  lineBuf[g_line_len] = 0;
+  g_cursor = g_line_len;
+  g_view_start = (g_line_len > visibleCols()) ? (g_line_len - visibleCols()) : 0;
+  renderLine();
+}
+static void beginBrowseIfNeeded() {
+  if (g_history_browse == -1) {
+    // save current edit buffer (for restore on down past newest)
+    size_t L = (g_line_len < (HISTORY_ENTRY_MAX - 1)) ? g_line_len : (HISTORY_ENTRY_MAX - 1);
+    memcpy(g_saved_before_browse, lineBuf, L);
+    g_saved_before_browse[L] = 0;
+    g_saved_before_browse_len = L;
+  }
+}
+static void browseUp() {
+  if (g_history_count == 0) return;
+  beginBrowseIfNeeded();
+  if (g_history_browse < (g_history_count - 1)) {
+    g_history_browse++;
+    int idx = g_history_count - 1 - g_history_browse;
+    setLineFrom(g_history[idx]);
+  }
+}
+static void browseDown() {
+  if (g_history_browse < 0) return;
+  if (g_history_browse > 0) {
+    g_history_browse--;
+    int idx = g_history_count - 1 - g_history_browse;
+    setLineFrom(g_history[idx]);
+  } else {
+    // exit browse, restore saved
+    g_history_browse = -1;
+    size_t L = (g_saved_before_browse_len < sizeof(lineBuf) - 1) ? g_saved_before_browse_len : (sizeof(lineBuf) - 1);
+    memcpy(lineBuf, g_saved_before_browse, L);
+    g_line_len = L;
+    lineBuf[g_line_len] = 0;
+    g_cursor = g_line_len;
+    g_view_start = (g_line_len > visibleCols()) ? (g_line_len - visibleCols()) : 0;
+    renderLine();
+  }
+}
+enum EscState {
+  ES_Normal,
+  ES_GotEsc,
+  ES_CSI,
+  ES_SS3,
+  ES_CSI_Param
+};
+static bool readLine() {
+  static EscState esc = ES_Normal;
+  static int csi_param = 0;
+  bool lineReady = false;
+  while (Serial.available()) {
+    int ic = Serial.read();
+    if (ic < 0) break;
+    char c = (char)ic;
+    if (esc == ES_Normal) {
+      if (c == '\r' || c == '\n') {
+        // Eat CRLF combo
+        if (c == '\r') {
+          if (Serial.available()) {
+            int p = Serial.peek();
+            if (p == '\n') Serial.read();
+          }
+        }
+        Serial.write('\r');
+        Serial.write('\n');
+        // Commit line
+        lineBuf[g_line_len] = 0;
+        // Push to history (non-empty)
+        if (g_line_len > 0) historyPush(lineBuf, g_line_len);
+        // Reset browsing state
+        g_history_browse = -1;
+        g_saved_before_browse[0] = 0;
+        g_saved_before_browse_len = 0;
+        // Reset render state for new prompt
+        g_last_render_len = 0;
+        g_cursor = 0;
+        g_line_len = 0;
+        g_view_start = 0;
+        lineReady = true;
+        break;
+      } else if ((c == 0x08) || (c == 0x7F)) {
+        // Backspace
+        if (g_cursor > 0) {
+          for (size_t i = g_cursor - 1; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
+          g_line_len--;
+          g_cursor--;
+          lineBuf[g_line_len] = 0;
+          renderLine();
+        } else {
+          Serial.write('\a');
+        }
+        continue;
+      } else if (c == 0x1B) {
+        esc = ES_GotEsc;
+        csi_param = 0;
+        continue;
+      } else if (c == '\t') {
+        // Simple tab: insert 2 spaces
+        if (g_line_len + 2 <= maxLineLen()) {
+          for (size_t i = g_line_len + 1; i >= g_cursor + 2; --i) lineBuf[i] = lineBuf[i - 2];
+          lineBuf[g_cursor] = ' ';
+          lineBuf[g_cursor + 1] = ' ';
+          g_cursor += 2;
+          g_line_len += 2;
+          lineBuf[g_line_len] = 0;
+          renderLine();
+        } else {
+          Serial.write('\a');
+        }
+        continue;
+      } else if (c == 0x01) {
+        // Ctrl+A -> Home
+        g_cursor = 0;
+        renderLine();
+        continue;
+      } else if (c == 0x05) {
+        // Ctrl+E -> End
+        g_cursor = g_line_len;
+        renderLine();
+        continue;
+      } else if (c == 0x0B) {
+        // Ctrl+K -> kill to end
+        g_line_len = g_cursor;
+        lineBuf[g_line_len] = 0;
+        renderLine();
+        continue;
+      } else if (c == 0x15) {
+        // Ctrl+U -> clear line
+        g_cursor = 0;
+        g_line_len = 0;
+        lineBuf[0] = 0;
+        g_view_start = 0;
+        renderLine();
+        continue;
+      } else if (c == 0x0C) {
+        // Ctrl+L -> redraw line (simple)
+        Serial.println();
+        renderLine();
+        continue;
+      } else if (c >= 32 && c <= 126) {
+        // Printable: insert at cursor
+        if (g_line_len + 1 <= maxLineLen()) {
+          for (size_t i = g_line_len; i > g_cursor; --i) lineBuf[i] = lineBuf[i - 1];
+          lineBuf[g_cursor] = c;
+          g_line_len++;
+          g_cursor++;
+          lineBuf[g_line_len] = 0;
+          renderLine();
+        } else {
+          Serial.write('\a');
+        }
+        continue;
+      } else {
+        // ignore others
+        continue;
+      }
+    } else if (esc == ES_GotEsc) {
+      if (c == '[') {
+        esc = ES_CSI;
+      } else if (c == 'O') {
+        esc = ES_SS3;  // function key like Home/End variants
+      } else {
+        esc = ES_Normal;
+      }
+    } else if (esc == ES_SS3) {
+      // Expect 'H' (Home) or 'F' (End)
+      if (c == 'H') {
+        g_cursor = 0;
+        renderLine();
+      } else if (c == 'F') {
+        g_cursor = g_line_len;
+        renderLine();
+      }
+      esc = ES_Normal;
+    } else if (esc == ES_CSI) {
+      if (c >= '0' && c <= '9') {
+        csi_param = (csi_param * 10) + (c - '0');
+        esc = ES_CSI_Param;
+      } else {
+        // single-char CSI
+        if (c == 'A') {
+          // Up
+          browseUp();
+        } else if (c == 'B') {
+          // Down
+          browseDown();
+        } else if (c == 'C') {
+          // Right
+          if (g_cursor < g_line_len) {
+            g_cursor++;
+            renderLine();
+          }
+        } else if (c == 'D') {
+          // Left
+          if (g_cursor > 0) {
+            g_cursor--;
+            renderLine();
+          }
+        } else if (c == 'H') {
+          g_cursor = 0;
+          renderLine();
+        } else if (c == 'F') {
+          g_cursor = g_line_len;
+          renderLine();
+        }
+        esc = ES_Normal;
+        csi_param = 0;
+      }
+    } else if (esc == ES_CSI_Param) {
+      if (c >= '0' && c <= '9') {
+        csi_param = (csi_param * 10) + (c - '0');
+      } else if (c == '~') {
+        // well-known: 3~ = Delete
+        if (csi_param == 3) {
+          if (g_cursor < g_line_len) {
+            for (size_t i = g_cursor; i + 1 < g_line_len; ++i) lineBuf[i] = lineBuf[i + 1];
+            g_line_len--;
+            lineBuf[g_line_len] = 0;
+            renderLine();
+          } else {
+            Serial.write('\a');
+          }
+        } else if (csi_param == 1 || csi_param == 7) {
+          g_cursor = 0;
+          renderLine();
+        } else if (csi_param == 4 || csi_param == 8) {
+          g_cursor = g_line_len;
+          renderLine();
+        }
+        esc = ES_Normal;
+        csi_param = 0;
+      } else {
+        esc = ES_Normal;
+        csi_param = 0;
+      }
+    }
+  }
+  return lineReady;
+}
+
+// ========== Compile Tiny-C source file -> raw Thumb binary on FS ==========
+static void printCompileErrorContext(const char* src, size_t srcLen, size_t pos) {
+  const size_t CONTEXT = 40;
+  if (!src || srcLen == 0) return;
+  size_t start = (pos > CONTEXT) ? (pos - CONTEXT) : 0;
+  size_t end = (pos + CONTEXT < srcLen) ? (pos + CONTEXT) : srcLen;
+  Console.println("----- context -----");
+  for (size_t i = start; i < end; ++i) {
+    char c = src[i];
+    if (c == '\r') c = ' ';
+    Console.print(c);
+  }
+  Console.println();
+  size_t caret = pos - start;
+  for (size_t i = 0; i < caret; ++i) Console.print(' ');
+  Console.println("^");
+  Console.println("-------------------");
+}
+static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
+  if (!checkNameLen(srcName) || !checkNameLen(dstName)) return false;
+  if (!activeFs.exists(srcName)) {
+    Console.print("compile: source not found: ");
+    Console.println(srcName);
+    return false;
+  }
+  uint32_t srcSize = 0;
+  if (!activeFs.getFileSize(srcName, srcSize) || srcSize == 0) {
+    Console.println("compile: getFileSize failed or empty source");
+    return false;
+  }
+  // Read source
+  char* srcBuf = (char*)malloc(srcSize + 1);
+  if (!srcBuf) {
+    Console.println("compile: malloc src failed");
+    return false;
+  }
+  uint32_t got = activeFs.readFile(srcName, (uint8_t*)srcBuf, srcSize);
+  if (got != srcSize) {
+    Console.println("compile: readFile failed");
+    free(srcBuf);
+    return false;
+  }
+  srcBuf[srcSize] = 0;
+  // Prepare output buffer
+  uint32_t outCap = (srcSize * 12u) + 256u;
+  if (outCap < 512u) outCap = 512u;
+  uint8_t* outBuf = (uint8_t*)malloc(outCap);
+  if (!outBuf) {
+    Console.println("compile: malloc out failed");
+    free(srcBuf);
+    return false;
+  }
+  MCCompiler comp;
+  size_t outSize = 0;
+  MCCompiler::Result r = comp.compile(srcBuf, srcSize, outBuf, outCap, &outSize);
+  if (!r.ok) {
+    Console.print("compile: error at pos ");
+    Console.print((uint32_t)r.errorPos);
+    Console.print(": ");
+    Console.println(r.errorMsg ? r.errorMsg : "unknown");
+    printCompileErrorContext(srcBuf, srcSize, r.errorPos);
+    free(outBuf);
+    free(srcBuf);
+    return false;
+  }
+  // Write to destination file
+  bool ok = writeBinaryToFS(dstName, outBuf, (uint32_t)outSize);
+  if (ok) {
+    Console.print("compile: OK -> ");
+    Console.print(dstName);
+    Console.print(" (");
+    Console.print((uint32_t)outSize);
+    Console.println(" bytes)");
+    if (outSize & 1u) {
+      Console.println("note: odd-sized output; for Thumb execution, even size is recommended.");
+    }
+  } else {
+    Console.println("compile: write failed");
+  }
+  free(outBuf);
+  free(srcBuf);
+  return ok;
+}
+
+// ================== Cross-filesystem copy (fscp) ==================
+static void fillFsIface(StorageBackend b, FSIface& out) {
+  if (b == StorageBackend::Flash) {
+    out.mount = [](bool autoFmt) {
+      return fsFlash.mount(autoFmt);
+    };
+    out.exists = [](const char* n) {
+      return fsFlash.exists(n);
+    };
+    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsFlash.createFileSlot(n, r, d, s);
+    };
+    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsFlash.writeFile(n, d, s, static_cast<W25QUnifiedSimpleFS::WriteMode>(m));
+    };
+    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsFlash.writeFileInPlace(n, d, s, a);
+    };
+    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsFlash.readFile(n, b, sz);
+    };
+    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsFlash.getFileInfo(n, a, s, c);
+    };
+  } else if (b == StorageBackend::NAND) {
+    out.mount = [](bool autoFmt) {
+      return fsNAND.mount(autoFmt);
+    };
+    out.exists = [](const char* n) {
+      return fsNAND.exists(n);
+    };
+    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsNAND.createFileSlot(n, r, d, s);
+    };
+    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsNAND.writeFile(n, d, s, static_cast<MX35UnifiedSimpleFS::WriteMode>(m));
+    };
+    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsNAND.writeFileInPlace(n, d, s, a);
+    };
+    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsNAND.readFile(n, b, sz);
+    };
+    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsNAND.getFileInfo(n, a, s, c);
+    };
+  } else {
+    out.mount = [](bool autoFmt) {
+      (void)autoFmt;
+      return fsPSRAM.mount(false);
+    };
+    out.exists = [](const char* n) {
+      return fsPSRAM.exists(n);
+    };
+    out.createFileSlot = [](const char* n, uint32_t r, const uint8_t* d, uint32_t s) {
+      return fsPSRAM.createFileSlot(n, r, d, s);
+    };
+    out.writeFile = [](const char* n, const uint8_t* d, uint32_t s, int m) {
+      return fsPSRAM.writeFile(n, d, s, m);
+    };
+    out.writeFileInPlace = [](const char* n, const uint8_t* d, uint32_t s, bool a) {
+      return fsPSRAM.writeFileInPlace(n, d, s, a);
+    };
+    out.readFile = [](const char* n, uint8_t* b, uint32_t sz) {
+      return fsPSRAM.readFile(n, b, sz);
+    };
+    out.getFileInfo = [](const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
+      return fsPSRAM.getFileInfo(n, a, s, c);
+    };
+  }
+}
+static bool parseBackendSpec(const char* spec, StorageBackend& outBackend, const char*& outPath) {
+  if (!spec) return false;
+  const char* colon = strchr(spec, ':');
+  if (!colon) return false;
+  size_t nameLen = (size_t)(colon - spec);
+  if (nameLen == 0) return false;
+  if (strncmp(spec, "flash", nameLen) == 0) outBackend = StorageBackend::Flash;
+  else if (strncmp(spec, "psram", nameLen) == 0) outBackend = StorageBackend::PSRAM_BACKEND;
+  else if (strncmp(spec, "nand", nameLen) == 0) outBackend = StorageBackend::NAND;
+  else return false;
+  outPath = colon + 1;  // may start with '/' or not
+  return true;
+}
+static bool normalizeFsPathCopy(char* dst, size_t dstCap, const char* input, bool wantTrailingSlash) {
+  if (!dst || !input) return false;
+  // Copy without leading '/'
+  const char* s = input;
+  while (*s == '/') ++s;
+  size_t L = strlen(s);
+  if (L >= dstCap) return false;
+  memcpy(dst, s, L + 1);
+  normalizePathInPlace(dst, wantTrailingSlash);
+  if (strlen(dst) > ActiveFS::MAX_NAME) return false;
+  return true;
+}
+static bool cmdFsCpImpl(const char* srcSpec, const char* dstSpec, bool force) {
+  StorageBackend sbSrc, sbDst;
+  const char* srcPathIn = nullptr;
+  const char* dstPathIn = nullptr;
+  if (!parseBackendSpec(srcSpec, sbSrc, srcPathIn) || !parseBackendSpec(dstSpec, sbDst, dstPathIn)) {
+    Console.println("fscp: invalid backend spec; use flash:/path psram:/path nand:/path");
+    return false;
+  }
+  // Prepare FS interfaces and mount (idempotent)
+  FSIface srcFS{}, dstFS{};
+  fillFsIface(sbSrc, srcFS);
+  fillFsIface(sbDst, dstFS);
+  // Mount: auto-format when empty on Flash/NAND; PSRAM no auto-format
+  bool srcMounted = srcFS.mount((sbSrc != StorageBackend::PSRAM_BACKEND));
+  bool dstMounted = dstFS.mount((sbDst != StorageBackend::PSRAM_BACKEND));
+  if (!srcMounted) {
+    Console.println("fscp: source mount failed");
+    return false;
+  }
+  if (!dstMounted) {
+    Console.println("fscp: destination mount failed");
+    return false;
+  }
+  // Normalize paths within 32-char limit
+  char srcAbs[ActiveFS::MAX_NAME + 1];
+  char dstArgRaw[ActiveFS::MAX_NAME + 1];
+  if (!normalizeFsPathCopy(srcAbs, sizeof(srcAbs), srcPathIn, /*wantTrailingSlash*/ false)) {
+    Console.println("fscp: source path too long (<=32)");
+    return false;
+  }
+  // Determine if destination is a folder spec (trailing '/')
+  size_t LdstIn = strlen(dstPathIn);
+  bool dstAsFolder = (LdstIn > 0 && dstPathIn[LdstIn - 1] == '/');
+  if (!normalizeFsPathCopy(dstArgRaw, sizeof(dstArgRaw), dstPathIn, dstAsFolder)) {
+    Console.println("fscp: destination path too long (<=32)");
+    return false;
+  }
+  // Source exists and info
+  if (!srcFS.exists(srcAbs)) {
+    Console.println("fscp: source not found");
+    return false;
+  }
+  uint32_t sAddr = 0, sSize = 0, sCap = 0;
+  if (!srcFS.getFileInfo(srcAbs, sAddr, sSize, sCap)) {
+    Console.println("fscp: getFileInfo(source) failed");
+    return false;
+  }
+  // Build destination absolute
+  char dstAbs[ActiveFS::MAX_NAME + 1];
+  if (dstAsFolder) {
+    const char* base = lastSlash(srcAbs);
+    if (!makePathSafe(dstAbs, sizeof(dstAbs), dstArgRaw, base)) {
+      Console.println("fscp: resulting destination path too long");
+      return false;
+    }
+  } else {
+    // already normalized as file
+    strncpy(dstAbs, dstArgRaw, sizeof(dstAbs));
+    dstAbs[sizeof(dstAbs) - 1] = 0;
+  }
+  if (pathTooLongForOnDisk(dstAbs)) {
+    Console.println("fscp: destination name too long for FS (would be truncated)");
+    return false;
+  }
+  // Overwrite policy
+  if (dstFS.exists(dstAbs) && !force) {
+    Console.println("fscp: destination exists (use -f to overwrite)");
+    return false;
+  }
+  // Read source fully (consistent with local cp)
+  uint8_t* buf = (uint8_t*)malloc(sSize ? sSize : 1);
+  if (!buf) {
+    Console.println("fscp: malloc failed");
+    return false;
+  }
+  uint32_t got = srcFS.readFile(srcAbs, buf, sSize);
+  if (got != sSize) {
+    Console.println("fscp: read failed");
+    free(buf);
+    return false;
+  }
+  // Reserve/erase alignment based on destination backend
+  uint32_t eraseAlign = getEraseAlignFor(sbDst);
+  uint32_t reserve = sCap;
+  if (reserve < eraseAlign) {
+    uint32_t a = (sSize + (eraseAlign - 1)) & ~(eraseAlign - 1);
+    if (a > reserve) reserve = a;
+  }
+  if (reserve < eraseAlign) reserve = eraseAlign;
+
+  bool ok = false;
+  if (!dstFS.exists(dstAbs)) {
+    ok = dstFS.createFileSlot(dstAbs, reserve, buf, sSize);
+  } else {
+    uint32_t dA, dS, dC;
+    if (!dstFS.getFileInfo(dstAbs, dA, dS, dC)) dC = 0;
+    if (dC >= sSize) ok = dstFS.writeFileInPlace(dstAbs, buf, sSize, false);
+    if (!ok) ok = dstFS.writeFile(dstAbs, buf, sSize, fsReplaceModeFor(sbDst));
+  }
+  free(buf);
+  if (!ok) {
+    Console.println("fscp: write failed");
+    return false;
+  }
+  Console.println("fscp: ok");
+  return true;
+}
+
 // ========== Serial console / command handling ==========
 static int nextToken(char*& p, char*& tok) {
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
@@ -1014,7 +2512,6 @@ static void printHelp() {
   Console.println("  cat <file> [n]               - print file contents (text); default: entire file (truncates at 4096)");
   Console.println("  cp <src> <dst|folder/> [-f]  - copy file; -f overwrites destination");
   Console.println("  fscp <sFS:path> <dFS:path|folder/> [-f] - copy across filesystems (FS=flash|psram|nand)");
-  Console.printf("  exec <file> [a0..aN] [&]     - execute blob with 0..%d int args on core1; '&' to background\n", (int)MAX_EXEC_ARGS);
   Console.println("  del <file>                   - delete a file");
   Console.println("  rm <file>                    - alias for 'del'");
   Console.println("  format                       - format active FS");
@@ -1073,11 +2570,9 @@ static void printHelp() {
   Console.println("  df                          - show device and FS usage");
   Console.println("  mv <src> <dst|folder/>      - move/rename file");
   Console.println();
-  Console.println("Co-Processor (serial RPC) commands:");
-  Console.println("  coproc ping|info|exec|sexec|func|status|mbox|cancel|reset|isp enter|exit");
-  Console.println();
   Console.println("Linux hints: base64 -w0 your.bin  |  xxd -p -c 999999 your.bin | tr -d '\\n'");
 }
+#include "NanoishTextEditor.h"
 static void handleCommand(char* line) {
   char* p = line;
   char* t0;
@@ -1129,21 +2624,18 @@ static void handleCommand(char* line) {
     if (!strcmp(tok, "flash")) {
       g_storage = StorageBackend::Flash;
       bindActiveFs(g_storage);
-      updateExecFsTable();
       bool ok = activeFs.mount(true);
       Console.println("Switched active storage to FLASH");
       Console.println(ok ? "Mounted FLASH (auto-format if empty)" : "Mount failed (FLASH)");
     } else if (!strcmp(tok, "psram")) {
       g_storage = StorageBackend::PSRAM_BACKEND;
       bindActiveFs(g_storage);
-      updateExecFsTable();
       bool ok = activeFs.mount(false);
       Console.println("Switched active storage to PSRAM");
       Console.println(ok ? "Mounted PSRAM (no auto-format)" : "Mount failed (PSRAM)");
     } else if (!strcmp(tok, "nand")) {
       g_storage = StorageBackend::NAND;
       bindActiveFs(g_storage);
-      updateExecFsTable();
       bool ok = activeFs.mount(true);
       Console.println("Switched active storage to NAND");
       Console.println(ok ? "Mounted NAND (auto-format if empty)" : "Mount failed (NAND)");
@@ -1344,93 +2836,6 @@ static void handleCommand(char* line) {
     if (!cmdFsCpImpl(srcSpec, dstSpec, force)) {
       Console.println("fscp failed");
     }
-  } else if (!strcmp(t0, "coproc")) {
-    char* sub;
-    if (!nextToken(p, sub)) {
-      Console.println("coproc cmds:");
-      Console.println("  coproc ping|info|exec <file> [a0..]|sexec <file> [a0..]|func <name> [a0..]|status|mbox [n]|cancel|reset|isp enter|exit");
-      return;
-    }
-    if (!strcmp(sub, "ping")) {
-      if (!Exec.coprocHello()) Console.println("coproc ping failed");
-    } else if (!strcmp(sub, "info")) {
-      if (!Exec.coprocInfo()) Console.println("coproc info failed");
-    } else if (!strcmp(sub, "sexec")) {
-      char* fname = nullptr;
-      if (!nextToken(p, fname)) {
-        Console.println("usage: coproc sexec <file> [a0..aN]");
-        return;
-      }
-      const char* tokens[MAX_EXEC_ARGS];
-      uint32_t argc = 0;
-      char* tok = nullptr;
-      while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) tokens[argc++] = tok;
-      if (!Exec.coprocScriptLoadFile(fname)) {
-        Console.println("coproc sexec failed: load failed");
-        return;
-      }
-      if (!Exec.coprocScriptExecTokens(tokens, argc)) Console.println("coproc sexec failed");
-    } else if (!strcmp(sub, "exec")) {
-      char* fname = nullptr;
-      if (!nextToken(p, fname)) {
-        Console.println("usage: coproc exec <file> [a0..aN]");
-        return;
-      }
-      const char* tokens[MAX_EXEC_ARGS];
-      uint32_t argc = 0;
-      char* tok = nullptr;
-      while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) tokens[argc++] = tok;
-      if (!Exec.coprocLoadFile(fname)) {
-        Console.println("coproc exec failed: load failed");
-        return;
-      }
-      if (!Exec.coprocExecTokens(tokens, argc)) Console.println("coproc exec failed");
-    } else if (!strcmp(sub, "func")) {
-      char* name = nullptr;
-      if (!nextToken(p, name)) {
-        Console.println("usage: coproc func <name> [a0..aN]");
-        return;
-      }
-      static int32_t argvN[MAX_EXEC_ARGS];
-      uint32_t argc = 0;
-      char* tok = nullptr;
-      while (nextToken(p, tok) && argc < MAX_EXEC_ARGS) {
-        argvN[argc++] = (int32_t)strtol(tok, nullptr, 0);
-      }
-      int32_t result = 0;
-      if (coprocCallFunc(name, argvN, argc, result)) {
-        Console.print("coproc func OK, result=");
-        Console.println(result);
-      } else {
-        Console.println("coproc func failed");
-      }
-    } else if (!strcmp(sub, "status")) {
-      if (!Exec.coprocStatus()) Console.println("coproc status failed");
-    } else if (!strcmp(sub, "mbox")) {
-      char* nstr;
-      uint32_t n = 128;
-      if (nextToken(p, nstr)) n = (uint32_t)strtoul(nstr, nullptr, 0);
-      if (!Exec.coprocMailboxRead(n)) Console.println("coproc mbox failed");
-    } else if (!strcmp(sub, "cancel")) {
-      if (!Exec.coprocCancel()) Console.println("coproc cancel failed");
-    } else if (!strcmp(sub, "reset")) {
-      if (!Exec.coprocReset()) Console.println("coproc reset failed (transport)");
-    } else if (!strcmp(sub, "isp")) {
-      char* arg = nullptr;
-      if (!nextToken(p, arg)) {
-        Console.println("usage: coproc isp enter|exit");
-        return;
-      }
-      if (!strcmp(arg, "enter")) {
-        if (!Exec.coprocIspEnter()) Console.println("coproc isp enter failed");
-      } else if (!strcmp(arg, "exit")) {
-        if (!Exec.coprocIspExit()) Console.println("coproc isp exit failed");
-      } else {
-        Console.println("usage: coproc isp enter|exit");
-      }
-    } else {
-      Console.println("usage: coproc ping|info|exec|sexec|func|status|mbox|cancel|reset|isp");
-    }
   } else if (!strcmp(t0, "blobs")) {
     listBlobs();
   } else if (!strcmp(t0, "rescanfs")) {
@@ -1440,19 +2845,6 @@ static void handleCommand(char* line) {
       const auto* di = uniMem.detectedInfo(i);
       if (!di) continue;
       Console.printf("  CS=%u  \tType=%s \tVendor=%s \tCap=%llu bytes\n", di->cs, UnifiedSpiMem::deviceTypeName(di->type), di->vendorName, (unsigned long long)di->capacityBytes);
-    }
-  } else if (!strcmp(t0, "timeout")) {
-    char* msStr;
-    if (!nextToken(p, msStr)) {
-      Console.print("timeout override = ");
-      Console.print((uint32_t)Exec.getTimeoutOverride());
-      Console.println(" ms (0 = use per-call defaults)");
-    } else {
-      uint32_t ms = (uint32_t)strtoul(msStr, nullptr, 0);
-      Exec.setTimeoutOverride(ms);
-      Console.print("timeout override set to ");
-      Console.print(ms);
-      Console.println(" ms");
     }
   } else if (!strcmp(t0, "meminfo")) {
     Console.println();
@@ -2104,27 +3496,6 @@ void setup() {
   delay(20);
   Console.println("System booting..");
   Console.begin();
-  // Arbiter + CBTLV3257 wiring help (this MCU = Owner A)
-  /*Console.println("External SPI arbiter wiring (this MCU = Owner A):");
-  Console.println("  REQ_A:   RP2040 GP4  -> ATtiny861A PA0 (active-low request)");
-  Console.println("  GRANT_A: RP2040 GP5  <- ATtiny861A PA4 (OWNER_A, high = granted)");
-  Console.println("CBTLV3257 control (driven by ATtiny861A):");
-  Console.println("  S (select, pin 1):  <- PB3  (selects between B1 and B2; B side selected when HIGH)");
-  Console.println("  OE# (enable, pin 15): <- PB4  (active LOW; bus connected when LOW)");
-  Console.println("  Vcc: pin 16, GND: pin 8");
-  Console.println("CBTLV3257 channel map:");
-  Console.println("  CH0 (SCK):   Master A -> pin 2  (1B1), \tMaster B -> pin 3  (1B2), \tY (shared) -> pin 4  (1A)");
-  Console.println("  CH1 (MOSI):  Master A -> pin 5  (2B1), \tMaster B -> pin 6  (2B2), \tY (shared) -> pin 7  (2A)");
-  Console.println("  CH2 (MISO):  Master A -> pin 11 (3B1), \tMaster B -> pin 10 (3B2), \tY (shared) -> pin 9  (3A)");
-  Console.println("  CH3 (opt):   Master A -> pin 14 (4B1), \tMaster B -> pin 13 (4B2), \tY (shared) -> pin 12 (4A)");
-  Console.println("Notes:");
-  Console.println("  - S = pin 1, OE# = pin 15. Device CS lines may remain direct from each MCU.");
-  Console.println("  - Master A = this MCU");
-  Console.println("  - Master B = co-processor MCU");
-  Console.println("  - Y = shared to memories");
-  Console.println();*/
-  // Enable arbiter guard (Host A)
-  //UnifiedSpiMem::ExternalArbiter::begin(/*REQ*/ 4, /*GRANT*/ 5, /*reqActiveLow*/ true, /*grantActiveHigh*/ true, /*defaultAcquireMs*/ 1000, /*shortAcquireMs*/ 300);
   uniMem.begin();
   uniMem.setPreservePsramContents(true);
   //uniMem.setCsList({ PIN_FLASH_CS0, PIN_PSRAM_CS0, PIN_PSRAM_CS1, PIN_PSRAM_CS2, PIN_PSRAM_CS3, PIN_NAND_CS, PIN_FLASH_CS1 });
@@ -2149,11 +3520,6 @@ void setup() {
   if (!mounted) {
     Console.println("FS mount failed on active storage");
   }
-  for (size_t i = 0; i < BLOB_MAILBOX_MAX; ++i) BLOB_MAILBOX[i] = 0;
-  Exec.attachConsole(&Console);
-  Exec.attachCoProc(&coprocLink, COPROC_BAUD);
-  updateExecFsTable();
-  Console.printf("Controller serial link ready @ %u bps (RX=GP%u, TX=GP%u)\n", (unsigned)COPROC_BAUD, (unsigned)PIN_COPROC_RX, (unsigned)PIN_COPROC_TX);
   // ---- Audio (WAV) + MIDI attach to FS/console/hooks ----
   // Audio
   {
@@ -2164,7 +3530,6 @@ void setup() {
     Audio.attachFS(afs);
     Audio.setConsole(&Console);
     Audio.setServiceHook([]() {
-      // Exec.pollBackground();
     });
     Audio.setCancelHook([]() -> bool {
       return false;
@@ -2182,7 +3547,6 @@ void setup() {
     MIDI.attachFS(mfs);
     MIDI.setConsole(&Console);
     MIDI.setServiceHook([]() {
-      // Exec.pollBackground();
     });
     MIDI.setCancelHook([]() -> bool {
       return false;
@@ -2207,14 +3571,11 @@ void setup() {
   Console.printf("System ready. Type 'help'\n> ");
 }
 void setup1() {
-  Exec.core1Setup();
 }
 void loop1() {
-  Exec.core1Poll();
   tight_loop_contents();
 }
 void loop() {
-  Exec.pollBackground();
   if (g_b64u.active) {
     b64uPump();
     return;
