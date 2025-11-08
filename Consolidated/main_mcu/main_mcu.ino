@@ -31,6 +31,8 @@ struct BlobReg;  // Forward declaration
 #define FILE_PT1 "pt1"
 #define FILE_PT2 "pt2"
 #define FILE_PT3 "pt3"
+#include "shrxbin.h"
+#include "rp_selfupdate.h"
 #include "shsha256.h"
 #include "shb64.h"
 static shb64s::State g_b64;
@@ -51,6 +53,8 @@ static bool g_midi_progress = true;                               // periodic pr
 static uint16_t g_midi_prog_ms = 250;                             // progress interval (ms)
 static int g_midi_track_index = -1;                               // -1 = auto-select by most NoteOn
 static bool g_midi_allow_q = true;                                // allow 'q' to stop playback
+
+static shrxbin::State g_rxbin;
 
 // ========== Pins for Memory Chips ==========
 const uint8_t PIN_FLASH_MISO = 4;               // GP4
@@ -535,6 +539,30 @@ static bool compileTinyCFileToFile(const char* srcName, const char* dstName) {
   return ok;
 }
 
+static bool devWriteAbs(void* ctx, uint32_t absAddr, const uint8_t* data, uint32_t len) {
+  (void)ctx;
+  UnifiedSpiMem::MemDevice* dev = nullptr;
+  switch (g_storage) {
+    case StorageBackend::Flash: dev = fsFlash.raw().device(); break;
+    case StorageBackend::PSRAM_BACKEND: dev = fsPSRAM.raw().device(); break;
+    case StorageBackend::NAND: dev = fsNAND.raw().device(); break;
+    default: dev = nullptr; break;
+  }
+  if (!dev) return false;
+  return dev->write(absAddr, data, len);
+}
+static bool devFinalizeSize(void* ctx, const char* name, uint32_t size, uint32_t baseAddr, uint32_t cap) {
+  (void)ctx;
+  (void)baseAddr;
+  (void)cap;
+  switch (g_storage) {
+    case StorageBackend::Flash: return fsFlash.setFileSize(name, size);
+    case StorageBackend::PSRAM_BACKEND: return fsPSRAM.setFileSize(name, size);
+    case StorageBackend::NAND: return fsNAND.setFileSize(name, size);
+    default: return false;
+  }
+}
+
 // ========== Serial console / command handling ==========
 static int nextToken(char*& p, char*& tok) {
   while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
@@ -712,18 +740,63 @@ static void handleCommand(char* line) {
       g_storage = StorageBackend::Flash;
       bindActiveFs(g_storage);
       bool ok = activeFs.mount(true);
+      {
+        // Re-attach FS to Audio (and MIDI) so callbacks point to the new active backend
+        AudioWavOut::FS afs{};
+        afs.exists = activeFs.exists;
+        afs.getFileSize = activeFs.getFileSize;
+        afs.readFileRange = activeFs.readFileRange;
+        Audio.attachFS(afs);
+
+        MidiPlayer::FS mfs{};
+        mfs.exists = activeFs.exists;
+        mfs.getFileSize = activeFs.getFileSize;
+        mfs.readFile = activeFs.readFile;
+        mfs.readFileRange = activeFs.readFileRange;
+        MIDI.attachFS(mfs);
+      }
       Console.println("Switched active storage to FLASH");
       Console.println(ok ? "Mounted FLASH (auto-format if empty)" : "Mount failed (FLASH)");
     } else if (!strcmp(tok, "psram")) {
       g_storage = StorageBackend::PSRAM_BACKEND;
       bindActiveFs(g_storage);
       bool ok = activeFs.mount(false);
+      {
+        // Re-attach FS to Audio (and MIDI) so callbacks point to the new active backend
+        AudioWavOut::FS afs{};
+        afs.exists = activeFs.exists;
+        afs.getFileSize = activeFs.getFileSize;
+        afs.readFileRange = activeFs.readFileRange;
+        Audio.attachFS(afs);
+
+        MidiPlayer::FS mfs{};
+        mfs.exists = activeFs.exists;
+        mfs.getFileSize = activeFs.getFileSize;
+        mfs.readFile = activeFs.readFile;
+        mfs.readFileRange = activeFs.readFileRange;
+        MIDI.attachFS(mfs);
+      }
       Console.println("Switched active storage to PSRAM");
       Console.println(ok ? "Mounted PSRAM (no auto-format)" : "Mount failed (PSRAM)");
     } else if (!strcmp(tok, "nand")) {
       g_storage = StorageBackend::NAND;
       bindActiveFs(g_storage);
       bool ok = activeFs.mount(true);
+      {
+        // Re-attach FS to Audio (and MIDI) so callbacks point to the new active backend
+        AudioWavOut::FS afs{};
+        afs.exists = activeFs.exists;
+        afs.getFileSize = activeFs.getFileSize;
+        afs.readFileRange = activeFs.readFileRange;
+        Audio.attachFS(afs);
+
+        MidiPlayer::FS mfs{};
+        mfs.exists = activeFs.exists;
+        mfs.getFileSize = activeFs.getFileSize;
+        mfs.readFile = activeFs.readFile;
+        mfs.readFileRange = activeFs.readFileRange;
+        MIDI.attachFS(mfs);
+      }
       Console.println("Switched active storage to NAND");
       Console.println(ok ? "Mounted NAND (auto-format if empty)" : "Mount failed (NAND)");
     } else {
@@ -1614,6 +1687,62 @@ static void handleCommand(char* line) {
       Console.println("  midi play pwmdac <file> [gapMs] [wave=sine|square|saw] [amp%] [sr]");
     }
 
+  } else if (!strcmp(t0, "putbin")) {
+    char* fn = nullptr;
+    char* sz = nullptr;
+    if (!nextToken(p, fn) || !nextToken(p, sz)) {
+      Console.println("usage: putbin <file> <size>");
+      return;
+    }
+    if (!checkNameLen(fn)) return;
+    if (shrxbin::active(g_rxbin)) {
+      Console.println("putbin: another transfer is active");
+      return;
+    }
+
+    uint32_t total = (uint32_t)strtoul(sz, nullptr, 0);
+    if (total == 0) {
+      Console.println("putbin: size must be > 0");
+      return;
+    }
+
+    // Prepare sector-aligned slot
+    if (activeFs.exists && activeFs.exists(fn)) {
+      if (!activeFs.deleteFile(fn)) {
+        Console.println("putbin: failed to delete existing file");
+        return;
+      }
+    }
+    uint32_t eraseAlign = getEraseAlign();
+    uint32_t reserve = (total + (eraseAlign - 1)) & ~(eraseAlign - 1);
+    if (!activeFs.createFileSlot(fn, reserve, nullptr, 0)) {
+      Console.println("putbin: createFileSlot failed");
+      return;
+    }
+
+    // Get base/cap
+    uint32_t base, size, cap;
+    if (!activeFs.getFileInfo(fn, base, size, cap)) {
+      Console.println("putbin: getFileInfo failed");
+      return;
+    }
+    if (cap < total) {
+      Console.println("putbin: slot cap < size");
+      return;
+    }
+
+    shrxbin::Writer wr;
+    wr.writeAbs = devWriteAbs;
+    wr.finalizeSize = devFinalizeSize;
+    wr.ctx = nullptr;
+    wr.baseAddr = base;
+    wr.cap = cap;
+
+    if (!shrxbin::begin(g_rxbin, Serial, fn, total, wr)) {
+      Console.println("putbin: begin failed");
+      return;
+    }
+    return;
   } else {
     Console.println("Unknown command. Type 'help'.");
   }
@@ -1622,7 +1751,7 @@ static void handleCommand(char* line) {
 // ========== Setup and main loops ==========
 void setup() {
   delay(500);
-  Serial.begin(115200);
+  Serial.begin(2000000);
   while (!Serial) { delay(20); }
   delay(20);
 
@@ -1727,22 +1856,27 @@ void setup() {
   Console.printf("System ready. Type 'help'\n");
   shline::printPrompt(g_le);
 }
-
 void setup1() {
 }
-
 void loop1() {
   tight_loop_contents();
 }
-
 void loop() {
   char cmdBuf[SHLINE_MAX_LINE];
+
+  // If a binary upload is active, pump it and pause the console
+  if (shrxbin::active(g_rxbin)) {
+    shrxbin::pump(g_rxbin);
+    return;
+  }
+
   if (shb64s::active(g_b64)) {
     shb64s::pump(g_b64);
     return;
   }
+
   if (shline::poll(g_le, cmdBuf, sizeof(cmdBuf))) {
     handleCommand(cmdBuf);
-    shline::printPrompt(g_le);  // Advanced mode renders; Basic needs prompt
+    shline::printPrompt(g_le);
   }
 }

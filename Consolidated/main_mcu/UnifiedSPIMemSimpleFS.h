@@ -589,6 +589,20 @@ public:
     capOut = (_files[idx].capEnd > _files[idx].addr) ? (_files[idx].capEnd - _files[idx].addr) : 0;
     return true;
   }
+  bool setFileSizeMeta(const char* name, uint32_t newSize) {
+    ensureParams();
+    if (!validName(name)) return false;
+    int idx = findIndexByName(name);
+    if (idx < 0 || _files[idx].deleted) return false;
+    FileInfo& fi = _files[idx];
+    uint32_t cap = (fi.capEnd > fi.addr) ? (fi.capEnd - fi.addr) : 0;
+    if (newSize > cap) return false;  // don't advertise more than reserved
+    uint32_t seq = 0;
+    if (!appendDirEntry(0x00, name, fi.addr, newSize, seq)) return false;
+    fi.size = newSize;
+    fi.seq = seq;
+    return true;
+  }
   bool exists(const char* name) {
     int idx = findIndexByName(name);
     return (idx >= 0 && !_files[idx].deleted);
@@ -921,6 +935,10 @@ public:
     if (!_fs) return false;
     return _fs->getFileInfo(name, addrOut, sizeOut, capOut);
   }
+  bool setFileSize(const char* name, uint32_t size) {
+    if (!_fs) return false;
+    return _fs->setFileSizeMeta(name, size);
+  }
   bool exists(const char* name) {
     if (!_fs) return false;
     return _fs->exists(name);
@@ -1046,6 +1064,9 @@ public:
   bool getFileInfo(const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
     return _core.getFileInfo(n, a, s, c);
   }
+  bool setFileSize(const char* n, uint32_t s) {
+    return _core.setFileSize(n, s);
+  }
   bool exists(const char* n) {
     return _core.exists(n);
   }
@@ -1120,6 +1141,9 @@ public:
   bool getFileInfo(const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
     return _core.getFileInfo(n, a, s, c);
   }
+  bool setFileSize(const char* n, uint32_t s) {
+    return _core.setFileSize(n, s);
+  }
   bool exists(const char* n) {
     return _core.exists(n);
   }
@@ -1193,6 +1217,9 @@ public:
   }
   bool getFileInfo(const char* n, uint32_t& a, uint32_t& s, uint32_t& c) {
     return _core.getFileInfo(n, a, s, c);
+  }
+  bool setFileSize(const char* n, uint32_t s) {
+    return _core.setFileSize(n, s);
   }
   bool exists(const char* n) {
     return _core.exists(n);

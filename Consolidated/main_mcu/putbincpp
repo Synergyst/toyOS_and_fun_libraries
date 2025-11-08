@@ -1,0 +1,214 @@
+// putbin.cpp - Windows native raw chunked uploader (COM10+ safe, better errors)
+// Usage: putbin.exe <COMx|\\\\.\\COMx> <local.bin> <remoteName> [baud=115200] [chunk=16384]
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <cstdio>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <chrono>
+#include <cstring>
+
+static const uint8_t MAGIC[4] = { 0xA5, 0x5A, 0x4B, 0x52 };
+
+static void print_winerr(const char* ctx) {
+    DWORD e = GetLastError();
+    LPVOID msg = nullptr;
+    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, e, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&msg, 0, NULL);
+    std::fprintf(stderr, "%s failed, WinErr=%lu: %s\n", ctx, (unsigned long)e, msg ? (char*)msg : "(no message)");
+    if (msg) LocalFree(msg);
+}
+
+static std::string canon_port_name(std::string p) {
+    // If already device path, keep it
+    if (p.rfind("\\\\.\\", 0) == 0) return p;
+    // If "COM<number>" and number >= 10, prefix with "\\.\"
+    if (p.size() > 3 && (p[0] == 'C' || p[0] == 'c') && (p[1] == 'O' || p[1] == 'o') && (p[2] == 'M' || p[2] == 'm')) {
+        int num = std::atoi(p.c_str() + 3);
+        if (num >= 10) return std::string("\\\\.\\") + p;
+    }
+    return p;
+}
+
+static uint32_t crc32_table[256];
+static void crc32_init() {
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; ++j)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc32_table[i] = c;
+    }
+}
+static uint32_t crc32_buf(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i)
+        c = crc32_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static bool write_all(HANDLE h, const void* buf, DWORD len) {
+    const uint8_t* p = (const uint8_t*)buf;
+    DWORD done = 0;
+    while (done < len) {
+        DWORD w = 0;
+        if (!WriteFile(h, p + done, len - done, &w, nullptr)) return false;
+        if (w == 0) return false;
+        done += w;
+    }
+    return true;
+}
+
+static bool read_until_line(HANDLE h, std::string& out, DWORD timeoutMs) {
+    out.clear();
+    auto start = std::chrono::steady_clock::now();
+    COMMTIMEOUTS t{};
+    if (!GetCommTimeouts(h, &t)) return false;
+    t.ReadIntervalTimeout = 50;
+    t.ReadTotalTimeoutMultiplier = 0;
+    t.ReadTotalTimeoutConstant = 50;
+    if (!SetCommTimeouts(h, &t)) return false;
+
+    for (;;) {
+        char ch = 0;
+        DWORD r = 0;
+        if (ReadFile(h, &ch, 1, &r, nullptr) && r == 1) {
+            out.push_back(ch);
+            if (ch == '\n') {
+                while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
+                return true;
+            }
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        if (elapsed > timeoutMs) return false;
+    }
+}
+
+static bool open_serial(const std::string& rawPort, DWORD baud, HANDLE& h) {
+    std::string port = canon_port_name(rawPort);
+    h = CreateFileA(port.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { print_winerr(("CreateFileA(" + port + ")").c_str()); return false; }
+
+    DCB dcb{};
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(h, &dcb)) { print_winerr("GetCommState"); return false; }
+    dcb.BaudRate = baud;
+    dcb.ByteSize = 8;
+    dcb.Parity = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.fOutxCtsFlow = FALSE;
+    dcb.fRtsControl = RTS_CONTROL_DISABLE;
+    dcb.fOutxDsrFlow = FALSE;
+    dcb.fDtrControl = DTR_CONTROL_ENABLE; // assert DTR; many CDC stacks gate data on this
+    if (!SetCommState(h, &dcb)) { print_winerr("SetCommState"); return false; }
+
+    COMMTIMEOUTS to{};
+    to.ReadIntervalTimeout = 50;
+    to.ReadTotalTimeoutMultiplier = 0;
+    to.ReadTotalTimeoutConstant = 50;
+    to.WriteTotalTimeoutMultiplier = 0;
+    to.WriteTotalTimeoutConstant = 5000;
+    if (!SetCommTimeouts(h, &to)) { print_winerr("SetCommTimeouts"); return false; }
+
+    SetupComm(h, 1 << 20, 1 << 20);
+    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        std::fprintf(stderr, "Usage: %s <COMx|\\\\.\\COMx> <local.bin> <remoteName> [baud=115200] [chunk=16384]\n", argv[0]);
+        return 1;
+    }
+    std::string port = argv[1];
+    std::string path = argv[2];
+    std::string remote = argv[3];
+    DWORD baud = (argc >= 5) ? std::strtoul(argv[4], nullptr, 10) : 115200;
+    size_t chunk = (argc >= 6) ? std::strtoul(argv[5], nullptr, 10) : 16384;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "File open failed: %s\n", path.c_str()); return 1; }
+    f.seekg(0, std::ios::end);
+    uint64_t total = (uint64_t)f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (total == 0) { std::fprintf(stderr, "Zero-length file.\n"); return 1; }
+
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!open_serial(port, baud, h)) {
+        std::fprintf(stderr, "Open serial failed: %s\n", port.c_str());
+        return 1;
+    }
+
+    Sleep(200);
+    PurgeComm(h, PURGE_RXCLEAR);
+
+    char cmd[512];
+    std::snprintf(cmd, sizeof(cmd), "putbin %s %llu\r\n", remote.c_str(), (unsigned long long)total);
+    if (!write_all(h, cmd, (DWORD)strlen(cmd))) { print_winerr("Write command"); return 1; }
+    std::printf("Sent: %s", cmd);
+
+    std::string line;
+    do {
+        if (!read_until_line(h, line, 15000)) { std::fprintf(stderr, "Timeout waiting READY\n"); return 1; }
+        std::printf("< %s\n", line.c_str());
+    } while (line.rfind("READY", 0) != 0);
+
+    crc32_init();
+
+    std::vector<uint8_t> payload;
+    payload.resize(chunk);
+    std::vector<uint8_t> frame;
+
+    uint64_t sent = 0;
+    auto t0 = std::chrono::steady_clock::now();
+
+    while (sent < total) {
+        size_t toRead = (size_t)std::min<uint64_t>(chunk, total - sent);
+        f.read((char*)payload.data(), toRead);
+        size_t rd = (size_t)f.gcount();
+        if (rd != toRead) { std::fprintf(stderr, "Short read\n"); return 1; }
+
+        frame.resize(16 + rd);
+        std::memcpy(frame.data(), MAGIC, 4);
+        uint32_t off = (uint32_t)sent;
+        uint32_t len = (uint32_t)rd;
+        uint32_t crc = crc32_buf(payload.data(), rd);
+        std::memcpy(frame.data() + 4, &off, 4);
+        std::memcpy(frame.data() + 8, &len, 4);
+        std::memcpy(frame.data() + 12, &crc, 4);
+        std::memcpy(frame.data() + 16, payload.data(), rd);
+
+        if (!write_all(h, frame.data(), (DWORD)frame.size())) { print_winerr("Write frame"); return 1; }
+        sent += rd;
+
+        uint64_t step = 512ull * 1024ull;
+        if ((sent % step) == 0 || sent == total) {
+            auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            double mb = sent / (1024.0 * 1024.0);
+            double sp = mb / (dt > 0 ? dt : 1e-6);
+            std::printf("  %.2f MiB sent  (%.2f MiB/s)\n", mb, sp);
+        }
+    }
+
+    frame.resize(16);
+    std::memcpy(frame.data(), MAGIC, 4);
+    uint32_t off = 0xFFFFFFFFu, len = 0u, crc = 0u;
+    std::memcpy(frame.data() + 4, &off, 4);
+    std::memcpy(frame.data() + 8, &len, 4);
+    std::memcpy(frame.data() + 12, &crc, 4);
+    if (!write_all(h, frame.data(), (DWORD)frame.size())) { print_winerr("Write commit"); return 1; }
+    std::puts("Commit sent, waiting for OK...");
+
+    for (;;) {
+        if (!read_until_line(h, line, 20000)) { std::fprintf(stderr, "Timeout waiting for completion\n"); return 1; }
+        std::printf("< %s\n", line.c_str());
+        if (line.rfind("OK", 0) == 0) break;
+        if (line.rfind("ERR", 0) == 0) { std::fprintf(stderr, "Device reported error\n"); return 1; }
+    }
+
+    CloseHandle(h);
+    std::puts("Done.");
+    return 0;
+}
