@@ -41,6 +41,21 @@
 #define MX35_SPI_CLOCK_HZ UNIFIED_SPI_CLOCK_HZ
 #endif
 
+// ESP32 internal PSRAM integration (virtual device presented through UnifiedSPIMem)
+#if defined(ARDUINO_ARCH_ESP32)
+#ifndef UNIFIED_ESP32_INT_PSRAM_ENABLE
+#define UNIFIED_ESP32_INT_PSRAM_ENABLE 1
+#endif
+// Keep some PSRAM free for system/heap (tune as needed)
+#ifndef UNIFIED_ESP32_PSRAM_RESERVE_BYTES
+#define UNIFIED_ESP32_PSRAM_RESERVE_BYTES (256u * 1024u)
+#endif
+#include <esp_arduino_version.h>
+#include <esp_system.h>
+#include <esp_heap_caps.h>
+extern "C" bool psramFound(void);
+#endif
+
 // ====================== External Arbiter (optional, runtime enable) ======================
 namespace UnifiedSpiMem {
 struct ExternalArbiter {
@@ -71,10 +86,7 @@ struct ExternalArbiter {
   }
   static void disable() {
     if (enabled) {
-      // deassert request if we hold it
-      if (depth > 0) {
-        digitalWrite(pinReq, reqActiveLow ? HIGH : LOW);
-      }
+      if (depth > 0) digitalWrite(pinReq, reqActiveLow ? HIGH : LOW);
     }
     enabled = false;
     depth = 0;
@@ -89,13 +101,11 @@ struct ExternalArbiter {
       return true;
     }
     if (++depth > 1) return true;
-    // assert request
     digitalWrite(pinReq, reqActiveLow ? LOW : HIGH);
     uint32_t t0 = millis();
     uint32_t to = timeoutMs ? timeoutMs : defaultAcquireMs;
     while (!isGranted()) {
       if (to && (millis() - t0) > to) {
-        // timeout: unwind and deassert
         depth = 0;
         digitalWrite(pinReq, reqActiveLow ? HIGH : LOW);
         return false;
@@ -110,10 +120,7 @@ struct ExternalArbiter {
       return;
     }
     if (depth == 0) return;
-    if (--depth == 0) {
-      // deassert request
-      digitalWrite(pinReq, reqActiveLow ? HIGH : LOW);
-    }
+    if (--depth == 0) digitalWrite(pinReq, reqActiveLow ? HIGH : LOW);
   }
   struct Guard {
     bool ok;
@@ -138,7 +145,6 @@ inline uint32_t ExternalArbiter::shortAcquireMs = 300;
 template<typename SPI_T>
 inline void spiBeginWithPins(SPI_T& spi, int8_t sck, int8_t miso, int8_t mosi, int8_t ss = -1) {
 #if defined(ARDUINO_ESP32) || defined(ARDUINO_ARCH_ESP32)
-  // Arduino-ESP32: begin with explicit pins
   spi.begin(sck, miso, mosi, ss);
 #elif defined(ARDUINO_ARCH_RP2040)
   spi.setRX(miso);
@@ -150,7 +156,7 @@ inline void spiBeginWithPins(SPI_T& spi, int8_t sck, int8_t miso, int8_t mosi, i
   (void)miso;
   (void)mosi;
   (void)ss;
-  spi.begin();  // Fall back to default pins
+  spi.begin();
 #endif
 }
 
@@ -188,12 +194,11 @@ public:
     return waitReady(timeoutMs);
   }
   uint8_t getFeature(uint8_t addr) {
-    uint8_t v = 0;
     csLow();
     beginTx();
     MX35_SPI_INSTANCE.transfer((uint8_t)0x0F);
     MX35_SPI_INSTANCE.transfer(addr);
-    v = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
+    uint8_t v = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
     endTx();
     csHigh();
     return v;
@@ -230,17 +235,15 @@ public:
     csHigh();
   }
   void readId90(uint8_t& did1, uint8_t& did2, uint8_t& dummyOut) {
-    uint8_t dmy = 0, a0 = 0, d1 = 0, d2 = 0;
     csLow();
     beginTx();
     MX35_SPI_INSTANCE.transfer((uint8_t)0x90);
-    dmy = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
-    a0 = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
-    d1 = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
-    d2 = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
+    uint8_t dmy = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
+    (void)MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
+    uint8_t d1 = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
+    uint8_t d2 = MX35_SPI_INSTANCE.transfer((uint8_t)0x00);
     endTx();
     csHigh();
-    (void)a0;
     dummyOut = dmy;
     did1 = d1;
     did2 = d2;
@@ -304,6 +307,7 @@ private:
     MX35_SPI_INSTANCE.endTransaction();
   }
 };
+
 // --------------------------- PSRAMBitbang (bit-bang SPI) ---------------------------
 #ifndef PSRAMBITBANG_H
 #define PSRAMBITBANG_H
@@ -583,7 +587,7 @@ private:
   }
 };
 #else
-// Bit-bang version omitted here for brevity; keep your existing one unchanged.
+// Bit-bang version (kept compatible with previous code)
 #include <inttypes.h>
 #if (defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_RASPBERRY_PI_PICO) || defined(ARDUINO_GENERIC_RP2040)) && !defined(BB_USE_RP2040_SIO)
 #define BB_USE_RP2040_SIO 1
@@ -592,7 +596,6 @@ private:
 #include "hardware/structs/sio.h"
 #endif
 class W25QBitbang {
-  // ... keep your existing non-HW SPI implementation unchanged ...
 public:
   W25QBitbang(uint8_t pinMiso, uint8_t pinCs, uint8_t pinSck, uint8_t pinMosi)
     : _miso(pinMiso), _cs(pinCs), _sck(pinSck), _mosi(pinMosi) {
@@ -887,9 +890,8 @@ public:
   }
   void setCsList(std::initializer_list<uint8_t> list) {
     clearCsList();
-    for (auto cs : list) {
+    for (auto cs : list)
       if (_csCount < UNIFIED_MAX_CS) _csPins[_csCount++] = cs;
-    }
     ensureAllCsHigh();
   }
   bool scanSingle(uint8_t cs, uint32_t hzForId = UNIFIED_SPI_CLOCK_HZ) {
@@ -903,15 +905,22 @@ public:
         _reserved[_detectedCount] = false;
         _detectedCount++;
       }
-      return true;
     }
-    return false;
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+    maybeAddEsp32InternalPsram();
+#endif
+    return _detectedCount > 0;
   }
   size_t scan(const uint8_t* csList, size_t count, uint32_t hzForId = UNIFIED_SPI_CLOCK_HZ) {
     setCsList(csList, count);
     _detectedCount = 0;
     for (size_t i = 0; i < UNIFIED_MAX_DETECTED; ++i) _reserved[i] = false;
-    if (!csList || count == 0) return 0;
+    if (!csList || count == 0) {
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+      maybeAddEsp32InternalPsram();
+#endif
+      return _detectedCount;
+    }
     for (size_t i = 0; i < count; ++i) {
       DeviceInfo info{};
       if (identifyCS(csList[i], info, hzForId)) {
@@ -922,6 +931,9 @@ public:
         }
       }
     }
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+    maybeAddEsp32InternalPsram();
+#endif
     return _detectedCount;
   }
   size_t scan(std::initializer_list<uint8_t> list, uint32_t hzForId = UNIFIED_SPI_CLOCK_HZ) {
@@ -938,22 +950,32 @@ public:
         }
       }
     }
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+    maybeAddEsp32InternalPsram();
+#endif
     return _detectedCount;
   }
   size_t rescan(uint32_t hzForId = UNIFIED_SPI_CLOCK_HZ) {
-    if (_csCount == 0) return 0;
+    if (_csCount == 0) {
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+      _detectedCount = 0;
+      for (size_t i = 0; i < UNIFIED_MAX_DETECTED; ++i) _reserved[i] = false;
+      maybeAddEsp32InternalPsram();
+      return _detectedCount;
+#else
+      return 0;
+#endif
+    }
     return scan(_csPins, _csCount, hzForId);
   }
   size_t detectedCount() const {
     return _detectedCount;
   }
   const DeviceInfo* detectedInfo(size_t idx) const {
-    if (idx >= _detectedCount) return nullptr;
-    return &_detected[idx];
+    return (idx < _detectedCount) ? &_detected[idx] : nullptr;
   }
   DeviceType typeAt(size_t idx) const {
-    if (idx >= _detectedCount) return DeviceType::Unknown;
-    return _detected[idx].type;
+    return (idx < _detectedCount) ? _detected[idx].type : DeviceType::Unknown;
   }
   size_t getDetectedTypes(DeviceType* out, size_t maxOut) const {
     if (!out || maxOut == 0) return 0;
@@ -985,6 +1007,7 @@ public:
     _reserved[idx] = false;
     return true;
   }
+
   MemDevice* openByIndex(size_t idx);
   MemDevice* openByType(DeviceType t, size_t occurrence = 0) {
     int idx = findIndexByType(t, occurrence, true);
@@ -1003,9 +1026,9 @@ public:
   }
   MemDevice* openSingle(uint8_t cs, DeviceInfo* outInfo = nullptr);
   bool release(MemDevice* dev);
+
   // IDENTIFY with external-arbiter guard (short timeout)
   bool identifyCS(uint8_t cs, DeviceInfo& out, uint32_t spiHzForId = UNIFIED_SPI_CLOCK_HZ) {
-    // Acquire the external arbiter (short lock) if enabled
     {
       ExternalArbiter::Guard g(ExternalArbiter::shortAcquireMs);
       if (ExternalArbiter::enabled && !g.ok) {
@@ -1021,7 +1044,8 @@ public:
       delayMicroseconds(2);
       pinMode(cs, OUTPUT);
       digitalWrite(cs, HIGH);
-      // TRY MX35 SPI-NAND FIRST
+
+      // TRY MX35 SPI-NAND
       {
         if (_wp >= 0) {
           pinMode(_wp, OUTPUT);
@@ -1052,6 +1076,7 @@ public:
           return true;
         }
       }
+
       // NOR
       {
         W25QBitbang nor(_miso, cs, _sck, _mosi);
@@ -1074,7 +1099,8 @@ public:
           }
         }
       }
-      // PSRAM
+
+      // PSRAM (external SPI)
       {
         if (!_preservePsram) {
           beginTransaction(spiHzForId / 2);
@@ -1119,6 +1145,7 @@ public:
       return false;
     }
   }
+
   // SPI helpers
   static inline void beginTransaction(uint32_t hz) {
     SPISettings s(hz, MSBFIRST, SPI_MODE0);
@@ -1142,6 +1169,7 @@ public:
   uint8_t pinMISO() const {
     return _miso;
   }
+
 private:
   void ensureAllCsHigh() const {
     for (size_t i = 0; i < _csCount; ++i) {
@@ -1150,6 +1178,30 @@ private:
     }
   }
   MemDevice* createDevice(const DeviceInfo& info);
+
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+  void maybeAddEsp32InternalPsram() {
+    if (_detectedCount >= UNIFIED_MAX_DETECTED) return;
+    size_t total = ESP.getPsramSize();
+    if (total == 0 || !psramFound()) return;
+    // Avoid duplicates
+    for (size_t i = 0; i < _detectedCount; ++i)
+      if (_detected[i].type == DeviceType::Psram && _detected[i].cs == 0xFF) return;
+
+    DeviceInfo di{};
+    di.type = DeviceType::Psram;
+    di.cs = 0xFF;  // sentinel (no CS pin)
+    di.vendorId = 0;
+    di.vendorName = "ESP32-Internal";
+    di.partHint = "Internal PSRAM";
+    di.capacityBytes = (uint64_t)total;
+    di.jedecLen = 0;
+    _detected[_detectedCount] = di;
+    _reserved[_detectedCount] = false;
+    _detectedCount++;
+  }
+#endif
+
   uint8_t _sck, _mosi, _miso;
   int8_t _wp, _hold;
   DeviceInfo _detected[UNIFIED_MAX_DETECTED];
@@ -1197,7 +1249,7 @@ protected:
   uint8_t _cs;
 };
 
-// NOR adapter (with arbiter guard)
+// NOR adapter
 class NorMemDevice : public MemDevice {
 public:
   NorMemDevice(uint8_t pinMISO, uint8_t cs, uint8_t pinSCK, uint8_t pinMOSI, uint64_t capacityBytes)
@@ -1258,7 +1310,7 @@ private:
   W25QBitbang _nor;
 };
 
-// PSRAM adapter (with arbiter guard)
+// PSRAM adapter over SPI (external PSRAM)
 class PsramMemDevice : public MemDevice {
 public:
   PsramMemDevice(uint8_t cs, uint64_t capacityBytes, uint8_t pinSCK, uint8_t pinMOSI, uint8_t pinMISO)
@@ -1348,7 +1400,81 @@ private:
   uint8_t _sck, _mosi, _miso;
 };
 
-// SPI‑NAND adapter (with arbiter guard)
+// ESP32 internal PSRAM virtual device (place AFTER MemDevice is defined)
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+class Esp32InternalPsramMemDevice : public MemDevice {
+public:
+  Esp32InternalPsramMemDevice(uint64_t capacityBytes, uint32_t reserveBytes = UNIFIED_ESP32_PSRAM_RESERVE_BYTES)
+    : MemDevice(0xFF), _capacity(capacityBytes), _reserve(reserveBytes), _base(nullptr), _size(0) {
+    _t = DeviceType::Psram;
+  }
+  ~Esp32InternalPsramMemDevice() override {
+    if (_base) heap_caps_free(_base);
+    _base = nullptr;
+    _size = 0;
+  }
+  bool begin() {
+    size_t total = ESP.getPsramSize();
+    if (total == 0 || !psramFound()) return false;
+    if (_capacity > total) _capacity = total;
+    size_t availForDev = (size_t)_capacity;
+    if (_reserve >= availForDev) {
+      if (availForDev > 64 * 1024) _reserve = availForDev - 64 * 1024;
+      else _reserve = 0;
+    }
+    size_t alloc = availForDev - _reserve;
+    if (alloc < 64 * 1024) alloc = (availForDev > 64 * 1024) ? (availForDev - (32 * 1024)) : availForDev / 2;
+    _base = (uint8_t*)heap_caps_malloc(alloc, MALLOC_CAP_SPIRAM);
+    if (!_base) return false;
+    _size = alloc;
+    memset(_base, 0xFF, _size);
+    return true;
+  }
+  DeviceType type() const override {
+    return DeviceType::Psram;
+  }
+  uint64_t capacity() const override {
+    return _size;
+  }
+  uint32_t pageSize() const override {
+    return 1024;
+  }
+  uint32_t eraseSize() const override {
+    return 0;
+  }
+  size_t read(uint64_t addr, uint8_t* buf, size_t len) override {
+    if (!_base || !buf || len == 0) return 0;
+    if (addr >= _size) return 0;
+    size_t max = _size - (size_t)addr;
+    size_t n = (len > max) ? max : len;
+    memcpy(buf, _base + (size_t)addr, n);
+    return n;
+  }
+  bool write(uint64_t addr, const uint8_t* buf, size_t len) override {
+    if (!_base || !buf || len == 0) return true;
+    if (addr >= _size) return false;
+    size_t max = _size - (size_t)addr;
+    size_t n = (len > max) ? max : len;
+    memcpy(_base + (size_t)addr, buf, n);
+    return n == len;
+  }
+  bool eraseRange(uint64_t addr, uint64_t len) override {
+    if (!_base || len == 0) return true;
+    if (addr >= _size) return false;
+    size_t max = _size - (size_t)addr;
+    size_t n = (len > max) ? max : (size_t)len;
+    memset(_base + (size_t)addr, 0xFF, n);
+    return true;
+  }
+private:
+  uint64_t _capacity;
+  uint32_t _reserve;
+  uint8_t* _base;
+  size_t _size;
+};
+#endif  // ESP32 internal PSRAM
+
+// SPI‑NAND adapter
 class MX35NandMemDevice : public MemDevice {
 public:
   struct Geometry {
@@ -1391,6 +1517,7 @@ public:
   void setClock(uint32_t hz) {
     _spiHz = hz;
   }
+
   size_t read(uint64_t addr, uint8_t* buf, size_t len) override {
     using UA = ExternalArbiter;
     UA::Guard g(UA::defaultAcquireMs);
@@ -1400,8 +1527,7 @@ public:
     while (total < len) {
       uint32_t page = (uint32_t)(addr / _geo.pageSize);
       uint16_t col = (uint16_t)(addr % _geo.pageSize);
-      size_t maxChunk = (size_t)(_geo.pageSize - col);
-      size_t chunk = (len - total < maxChunk) ? (len - total) : maxChunk;
+      size_t chunk = (len - total < (size_t)(_geo.pageSize - col)) ? (len - total) : (size_t)(_geo.pageSize - col);
       if (!pageReadToCache(page)) break;
       if (!readFromCache(col, buf + total, chunk)) break;
       addr += chunk;
@@ -1417,8 +1543,7 @@ public:
     while (len > 0) {
       uint32_t page = (uint32_t)(addr / _geo.pageSize);
       uint16_t col = (uint16_t)(addr % _geo.pageSize);
-      size_t maxChunk = (size_t)(_geo.pageSize - col);
-      size_t chunk = (len < maxChunk) ? len : maxChunk;
+      size_t chunk = (len < (size_t)(_geo.pageSize - col)) ? len : (size_t)(_geo.pageSize - col);
       if (!programLoad(col, buf, chunk)) return false;
       if (!programExecute(page)) return false;
       addr += chunk;
@@ -1441,7 +1566,7 @@ public:
     }
     return true;
   }
-  // Low-level
+  // Low-level ops
   bool pageReadToCache(uint32_t row) {
     beginTx();
     csLow();
@@ -1576,6 +1701,16 @@ inline MemDevice* Manager::createDevice(const DeviceInfo& info) {
       }
     case DeviceType::Psram:
       {
+#if defined(ARDUINO_ARCH_ESP32) && UNIFIED_ESP32_INT_PSRAM_ENABLE
+        if (info.cs == 0xFF && strcmp(info.vendorName, "ESP32-Internal") == 0) {
+          auto* dev = new Esp32InternalPsramMemDevice(info.capacityBytes);
+          if (!dev->begin()) {
+            delete dev;
+            return nullptr;
+          }
+          return dev;
+        }
+#endif
         auto* dev = new PsramMemDevice(info.cs, info.capacityBytes, _sck, _mosi, _miso);
         dev->begin();
         return dev;
